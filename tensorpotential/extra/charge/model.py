@@ -676,6 +676,12 @@ def _tape_energy_forces_charge(instructions, input_data, training, local=False):
     # per-structure dE/dq -- no Jacobian needed. Sign convention:
     # work_function = dE/dq, matching LOREM and the razor/natcomm2025 labels.
     if g_q is not None:
+        # FiLM reaches the charge through tf.gather (broadcasting one charge to
+        # a structure's atoms), and the gradient of a gather is *sparse*, so the
+        # tape hands back IndexedSlices rather than a Tensor. Densify it, or
+        # every downstream consumer -- loss, metrics, .numpy() -- breaks.
+        if isinstance(g_q, tf.IndexedSlices):
+            g_q = tf.convert_to_tensor(g_q)
         g_q = tf.cast(g_q, dtype=pair_f.dtype)
     return e_atomic, pair_f, g_q
 
