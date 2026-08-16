@@ -23,6 +23,11 @@ ATOMIC_POS: Final[str] = "atomic_positions"
 ATOMIC_MU_I: Final[str] = "atomic_mu_i"
 ATOMIC_MU_I_LOCAL: Final[str] = "atomic_mu_i_local"
 ATOMIC_MAGMOM: Final[str] = "atomic_magmom"
+# Per-structure total charge, shape [n_struct, 1]. Optional: it only enters a
+# model's input signature when an instruction declares it (see
+# tensorpotential/extra/charge/), so models that do not condition on charge
+# never require it. Same treatment as ATOMIC_MAGMOM / ATOMIC_POS / CELL_VECTORS.
+TOTAL_CHARGE: Final[str] = "total_charge"
 ATOMS_TO_STRUCTURE_MAP: Final[str] = "map_atoms_to_structure"
 BONDS_TO_STRUCTURE_MAP: Final[str] = "map_bonds_to_structure"
 
