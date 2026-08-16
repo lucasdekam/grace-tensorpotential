@@ -61,9 +61,37 @@ class FiLMChargeScalar(TPInstruction):
         Born effective charges arose in a sibling project: the surface of a
         slab whose normal is `a` is spanned by `b` and `c`, not by `a` and `b`.
     modulate_linear_channel : bool
-        Channel 0 is the linear passthrough that `LinMLPOut2ScalarTarget`
-        routes around its MLP. True (default) lets the charge reach the
-        leading-order energy term; False leaves channel 0 untouched.
+        Whether FiLM also touches channel 0.
+
+        `LinMLPOut2ScalarTarget` computes `E_i = rho_0 + MLP(rho_1..rho_n)`,
+        and every `rho_k` is a learned linear contraction of the ACE basis
+        (`FunctionReduceN`), so **channel 0 is a linear ACE energy**,
+        sum_v c_v B_v. Routing it around the MLP keeps linear ACE as an exact
+        subspace of the model, which is where ACE's systematic improvability
+        comes from; the MLP then adds a correction rather than being the whole
+        model.
+
+        True (default): the summed `beta_0` term contributes `N * beta_0(Q)`, a
+        size-extensive purely charge-dependent offset -- i.e. the capacitive
+        q^2/2C energy, which this data demonstrably has (cpmace's d2E/dq2 is
+        +7.68 eV and near-constant across geometries). Reaching that through
+        the MLP branch alone is possible but indirect and entangled with the
+        geometry. `(1 + gamma_0)` additionally makes the linear ACE
+        coefficients charge-dependent, i.e. bonding responds to charge.
+
+        False: the linear ACE path stays exactly charge-independent, giving a
+        clean "charge-free linear reference + charge-dependent corrections"
+        split. Worth trying when **finetuning a pretrained foundation model**,
+        where rho_0 carries most of the energy and multiplying it by a growing
+        (1 + gamma_0) is the most destabilising thing FiLM could do early.
+
+        Note the two GRACE-2L branches are not symmetric here. `I_out_0_LN`
+        uses `InvariantLayerRMSNorm(type="only_nonlin")`, which passes channel
+        0 through completely untouched -- a pristine linear ACE term. `I_1_LN`
+        uses `type="full"`, which RMS-normalises *all* channels including 0, so
+        its "linear" channel is already per-atom rescaled and is not a pure
+        linear ACE energy. This flag therefore means something slightly
+        different on each branch.
     """
 
     def __init__(
