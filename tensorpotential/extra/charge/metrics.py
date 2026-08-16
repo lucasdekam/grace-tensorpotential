@@ -1,4 +1,12 @@
-"""Work-function metrics, mirroring `extra/gen_tensor/metrics.py`."""
+"""Work-function metrics, mirroring `extra/gen_tensor/metrics.py`.
+
+Reported as `mae/wf` and `rmse/wf` (cli/metrics.py rewrites the abs/sqr keys).
+Named for the quantity, not the residual: the `rmse/` prefix already says it is
+an error, and a `d_` prefix would be actively misleading here because the work
+function *is* a derivative, dE/dq -- `d_wf` reads as d(work function)/d(...).
+This also matches `f_comp` / `virial` / `stress`, which are likewise residuals
+named for the quantity; only `de` / `depa` carry a delta prefix.
+"""
 
 import tensorflow as tf
 
@@ -21,16 +29,16 @@ class WorkFunctionMetrics(AbstractMetrics):
         # being zero -- the prediction there is meaningless, not zero
         wf_true = input_data[cc.DATA_REFERENCE_WORK_FUNCTION][:n_struct_real]
         wf_pred = predictions[cc.PREDICT_WORK_FUNCTION][:n_struct_real]
-        d_wf = wf_true - wf_pred
+        err = wf_true - wf_pred
 
         return {
-            "abs/d_wf/per_struct": tf.reduce_sum(tf.math.abs(d_wf)),
-            "sqr/d_wf/per_struct": tf.reduce_sum(d_wf**2),
+            "abs/wf/per_struct": tf.reduce_sum(tf.math.abs(err)),
+            "sqr/wf/per_struct": tf.reduce_sum(err**2),
         }
 
     @property
     def normalization_spec(self) -> dict[str, dict]:
         return {
-            "abs/d_wf/per_struct": {"norm": "n_structures", "factor": 1.0},
-            "sqr/d_wf/per_struct": {"norm": "n_structures", "factor": 1.0},
+            "abs/wf/per_struct": {"norm": "n_structures", "factor": 1.0},
+            "sqr/wf/per_struct": {"norm": "n_structures", "factor": 1.0},
         }
