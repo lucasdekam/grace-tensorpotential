@@ -22,11 +22,50 @@ in a sibling project: for a slab whose normal is `a`, the surface is spanned by
 `b` and `c`, not by `a` and `b`. One conversion site.
 """
 
+import logging
+
 import numpy as np
 
 from tensorpotential import constants
 from tensorpotential.data.databuilder import AbstractDataBuilder, get_padding_dims
 from tensorpotential.extra.charge import constants as cc
+
+log = logging.getLogger()
+
+
+class _RunningStats:
+    """min/max/mean/std from running aggregates.
+
+    Deliberately not a list of values: `extract_from_ase_atoms` is also called
+    once per structure by the ASE calculator during MD, where nothing ever
+    drains it, so anything that grows per structure is a leak.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.total = 0.0
+        self.total_sq = 0.0
+        self.lo = float("inf")
+        self.hi = float("-inf")
+
+    def add(self, x):
+        x = float(x)
+        self.n += 1
+        self.total += x
+        self.total_sq += x * x
+        self.lo = min(self.lo, x)
+        self.hi = max(self.hi, x)
+
+    def summary(self, unit):
+        mean = self.total / self.n
+        var = max(self.total_sq / self.n - mean * mean, 0.0)
+        return (
+            f"{self.lo:+.3f} .. {self.hi:+.3f} {unit} "
+            f"(mean {mean:+.3f}, std {var**0.5:.3f})"
+        )
 
 
 class TotalChargeDataBuilder(AbstractDataBuilder):
@@ -57,13 +96,21 @@ class TotalChargeDataBuilder(AbstractDataBuilder):
         self.charge_key = charge_key
         self.work_function_key = work_function_key
         self.normalize_weights = normalize_weights
+        # reported once per dataset in postprocess_dataset, then reset -- the
+        # same builder instance handles train and test
+        self._q_stats = _RunningStats()
+        self._wf_stats = _RunningStats()
+        self._n_defaulted = 0
 
     def _from_atoms(self, ase_atoms):
-        res = {
-            constants.TOTAL_CHARGE: np.array(
-                float(ase_atoms.info.get(self.charge_key, self.default_charge))
-            ).reshape(-1, 1)
-        }
+        if self.charge_key in ase_atoms.info:
+            charge = float(ase_atoms.info[self.charge_key])
+        else:
+            charge = self.default_charge
+            self._n_defaulted += 1
+        self._q_stats.add(charge)
+
+        res = {constants.TOTAL_CHARGE: np.array(charge).reshape(-1, 1)}
         if self.fit_work_function:
             if self.work_function_key not in ase_atoms.info:
                 raise KeyError(
@@ -71,9 +118,9 @@ class TotalChargeDataBuilder(AbstractDataBuilder):
                     f"'{self.work_function_key}'. Charge conditioning alone does "
                     f"not need it -- set fit_work_function=False."
                 )
-            res[cc.DATA_REFERENCE_WORK_FUNCTION] = np.array(
-                float(ase_atoms.info[self.work_function_key])
-            ).reshape(-1, 1)
+            wf = float(ase_atoms.info[self.work_function_key])
+            self._wf_stats.add(wf)
+            res[cc.DATA_REFERENCE_WORK_FUNCTION] = np.array(wf).reshape(-1, 1)
             res[cc.DATA_WORK_FUNCTION_WEIGHTS] = np.ones((1, 1))
         return res
 
@@ -127,7 +174,46 @@ class TotalChargeDataBuilder(AbstractDataBuilder):
                 constant_values=0,
             )
 
+    def report(self):
+        """Log what was actually read, then reset for the next dataset.
+
+        The counts line is the one that earns its place: a missing
+        `total_charge` silently becomes `default_charge`, and since it is a
+        model *input* rather than a label, training on a quietly uncharged
+        dataset looks perfectly healthy from the loss curves.
+
+        The ranges are the extrapolation envelope -- FiLM sees the raw charge,
+        so anything outside them is out of distribution. And the work-function
+        std is the RMSE a mean predictor would score, which is what makes
+        `rmse/wf` interpretable the moment it appears.
+        """
+        n = self._q_stats.n
+        if n == 0:
+            return
+
+        if self._n_defaulted:
+            log.warning(
+                f"charge conditioning: {n - self._n_defaulted}/{n} structures carry "
+                f"'{self.charge_key}' in atoms.info; {self._n_defaulted} defaulted to "
+                f"{self.default_charge}"
+            )
+        else:
+            log.info(
+                f"charge conditioning: {self.charge_key} read from atoms.info "
+                f"for {n}/{n} structures"
+            )
+
+        line = f"  {self.charge_key} {self._q_stats.summary('e')}"
+        if self.fit_work_function and self._wf_stats.n:
+            line += f" | {self.work_function_key} {self._wf_stats.summary('V')}"
+        log.info(line)
+
+        self._q_stats.reset()
+        self._wf_stats.reset()
+        self._n_defaulted = 0
+
     def postprocess_dataset(self, batches):
+        self.report()
         if self.fit_work_function and self.normalize_weights:
             weight_sum = np.sum(
                 [np.sum(b[cc.DATA_WORK_FUNCTION_WEIGHTS]) for b in batches]
