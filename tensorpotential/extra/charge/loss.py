@@ -1,11 +1,11 @@
-"""Work-function loss, a per-structure weighted SSE.
+"""Work-function loss: a per-structure weighted squared or huber error on dE/dq.
 
 Enable in input.yaml with::
 
     fit:
       loss:
         extra_components:
-          WeightedSSEWorkFunctionLoss: {weight: 0.05}
+          WeightedWorkFunctionLoss: {weight: 0.05}
 """
 
 import tensorflow as tf
@@ -15,8 +15,15 @@ from tensorpotential.extra.charge.metrics import WorkFunctionMetrics
 from tensorpotential.loss import LossComponent, huber
 
 
-class WeightedSSEWorkFunctionLoss(LossComponent):
-    """Weighted sum of squared (or huber) errors on dE/dq.
+class WeightedWorkFunctionLoss(LossComponent):
+    """Weighted squared or huber error on dE/dq.
+
+    Named for the target, not the loss shape, unlike GRACE's core classes
+    (`WeightedSSEForceLoss` vs `WeightedHuberForceLoss` are separate classes
+    picked by a `type:` dispatch dict). This one takes `type` as a constructor
+    argument instead, because the `extra_components` path resolves a class by
+    name with no dispatch dict -- so a shape-per-class split would buy the YAML
+    nothing. An `SSE` prefix would then be a lie whenever `type: huber` is set.
 
     Per-structure, so this is shaped exactly like the virial loss rather than
     the force loss.
@@ -30,13 +37,13 @@ class WeightedSSEWorkFunctionLoss(LossComponent):
     def __init__(
         self,
         loss_component_weight,
-        name="WeightedSSEWorkFunctionLoss",
+        name="WeightedWorkFunctionLoss",
         type: str = "square",
         delta: float = 0.1,
         normalize_by_samples: bool = True,
         **kwargs,
     ):
-        super(WeightedSSEWorkFunctionLoss, self).__init__(
+        super(WeightedWorkFunctionLoss, self).__init__(
             loss_component_weight=loss_component_weight,
             name=name,
             normalize_by_samples=normalize_by_samples,
