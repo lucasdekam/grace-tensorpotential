@@ -133,6 +133,8 @@ class FiLMChargeScalar(TPInstruction):
         self.input_tensor_spec = {
             constants.TOTAL_CHARGE: {"shape": [None, 1], "dtype": "float"},
             constants.ATOMS_TO_STRUCTURE_MAP: {"shape": [None], "dtype": "int"},
+            # needed to zero gamma/beta on padded atoms -- see frwrd
+            constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
         }
         if self.normalize == "per_atom":
             self.input_tensor_spec[constants.N_STRUCTURES_BATCH_TOTAL] = {
@@ -204,6 +206,24 @@ class FiLMChargeScalar(TPInstruction):
         q_at = tf.gather(q, input_data[constants.ATOMS_TO_STRUCTURE_MAP])
 
         gamma_beta = self.mlp(q_at) * tf.cast(self.gate, x.dtype)
+
+        # Zero gamma and beta on PADDED atoms. Without this, FiLM breaks an
+        # invariant the rest of GRACE relies on: an isolated (fake) atom has all
+        # descriptors zero, and every MLP here is use_bias=False, so zero
+        # features give zero energy. FiLM is affine, so a padded atom instead
+        # gets 0*(1+gamma) + beta = beta != 0 -- and since padded atoms gather
+        # the REAL structure's charge via map_atoms_to_structure, that beta
+        # varies with q and leaks into both the energy and dE/dq.
+        #
+        # Verified: stock GRACE (GRACE-1L-OAM through TPCalculator) gives padded
+        # atoms exactly 0.000000 eV at any pad_atoms_number, while our FiLM
+        # models gave -0.117 eV and a 0.110 V shift in dE/dq. This is ours, not
+        # upstream.
+        real = tf.reshape(
+            tf.range(tf.shape(gamma_beta)[0], dtype=tf.int32), [-1, 1]
+        ) < input_data[constants.N_ATOMS_BATCH_REAL]
+        gamma_beta = tf.where(real, gamma_beta, tf.zeros_like(gamma_beta))
+
         gamma = gamma_beta[:, : self.n_out, None]
         beta = gamma_beta[:, self.n_out :, None]
 
