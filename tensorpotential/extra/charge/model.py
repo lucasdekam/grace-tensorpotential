@@ -667,20 +667,6 @@ def _tape_energy_forces_charge(instructions, input_data, training, local=False):
         tape.watch(q)
         execute_instructions(input_data, instructions, training, local=local)
         e_atomic = tf.reshape(input_data[constants.PREDICT_ATOMIC_ENERGY], [-1, 1])
-        # Mask padded atoms INSIDE the tape, so they contribute to neither the
-        # forces nor dE/dq. This is not the same fix as masking the energy sum
-        # afterwards: with a single structure, padded atoms gather the REAL
-        # structure's charge via map_atoms_to_structure, so FiLM gives them a
-        # beta(q) that varies with q and leaks into the reported work function.
-        # Measured as a systematic ~0.11 V offset between the reported dE/dq and
-        # a finite difference of the (masked) energy. The batched training path
-        # is immune -- there padded atoms map to a dummy structure at charge 0.
-        n_real = input_data.get(constants.N_ATOMS_BATCH_REAL)
-        if n_real is not None:
-            keep = tf.reshape(
-                tf.range(tf.shape(e_atomic)[0], dtype=tf.int32), [-1, 1]
-            ) < n_real
-            e_atomic = tf.where(keep, e_atomic, tf.zeros_like(e_atomic))
     g_bond, g_q = tape.gradient(e_atomic, [input_data[constants.BOND_VECTOR], q])
 
     pair_f = tf.negative(g_bond)
@@ -725,7 +711,6 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
         constants.N_STRUCTURES_BATCH_TOTAL: {"shape": [], "dtype": "int"},
         constants.BOND_VECTOR: {"shape": [None, 3], "dtype": "float"},
         constants.N_ATOMS_BATCH_TOTAL: {"shape": [], "dtype": "int"},
-        constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
         **_CHARGE_SPECS,
     }
 
@@ -769,7 +754,6 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
         constants.N_STRUCTURES_BATCH_TOTAL: {"shape": [], "dtype": "int"},
         constants.BOND_VECTOR: {"shape": [None, 3], "dtype": "float"},
         constants.N_ATOMS_BATCH_TOTAL: {"shape": [], "dtype": "int"},
-        constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
         **_CHARGE_SPECS,
     }
 
@@ -820,7 +804,6 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         constants.BOND_IND_J: {"shape": [None], "dtype": "int"},
         constants.BOND_VECTOR: {"shape": [None, 3], "dtype": "float"},
         constants.ATOMIC_MU_I: {"shape": [None], "dtype": "int"},
-        constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
         **_CHARGE_SPECS,
     }
 
@@ -840,21 +823,6 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         e_atomic, pair_f, dedq = _tape_energy_forces_charge(
             instructions, input_data, training, local=self.local
         )
-        # Mask padded atoms before summing. The stock
-        # ComputeStructureEnergyAndForcesAndVirial reduce_sums every entry, and
-        # the ASE calculator appends fake atoms whose atomic energy is NOT zero
-        # -- an isolated atom still gets a chemical embedding and an
-        # element-dependent reduce, so it carries that species' isolated-atom
-        # energy. Measured at a constant -0.1174 eV (one padded atom) on
-        # natcomm2025, i.e. 0.504 meV/atom of pure bias.
-        #
-        # Harmless for forces (a constant) and for MD at fixed padding, but the
-        # bias scales with the NUMBER of padded atoms, which adaptive padding
-        # varies per structure -- so energy *differences* between differently
-        # sized structures are wrong too. Other instructions here already mask
-        # on N_ATOMS_BATCH_REAL (InvariantLayerRMSNorm, TrainableShiftTarget);
-        # this sum did not.
-        # e_atomic is already masked inside the tape, so this sum is clean
         total_energy = tf.reduce_sum(e_atomic, axis=0, keepdims=True)
         nat = tf.shape(input_data[constants.ATOMIC_MU_I])[0]
         total_f = tf.math.unsorted_segment_sum(
