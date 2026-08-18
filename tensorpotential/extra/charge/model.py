@@ -804,6 +804,7 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         constants.BOND_IND_J: {"shape": [None], "dtype": "int"},
         constants.BOND_VECTOR: {"shape": [None, 3], "dtype": "float"},
         constants.ATOMIC_MU_I: {"shape": [None], "dtype": "int"},
+        constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
         **_CHARGE_SPECS,
     }
 
@@ -823,7 +824,26 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         e_atomic, pair_f, dedq = _tape_energy_forces_charge(
             instructions, input_data, training, local=self.local
         )
-        total_energy = tf.reduce_sum(e_atomic, axis=0, keepdims=True)
+        # Mask padded atoms before summing. The stock
+        # ComputeStructureEnergyAndForcesAndVirial reduce_sums every entry, and
+        # the ASE calculator appends fake atoms whose atomic energy is NOT zero
+        # -- an isolated atom still gets a chemical embedding and an
+        # element-dependent reduce, so it carries that species' isolated-atom
+        # energy. Measured at a constant -0.1174 eV (one padded atom) on
+        # natcomm2025, i.e. 0.504 meV/atom of pure bias.
+        #
+        # Harmless for forces (a constant) and for MD at fixed padding, but the
+        # bias scales with the NUMBER of padded atoms, which adaptive padding
+        # varies per structure -- so energy *differences* between differently
+        # sized structures are wrong too. Other instructions here already mask
+        # on N_ATOMS_BATCH_REAL (InvariantLayerRMSNorm, TrainableShiftTarget);
+        # this sum did not.
+        n_at_total = tf.shape(e_atomic)[0]
+        n_at_real = input_data[constants.N_ATOMS_BATCH_REAL]
+        real = tf.reshape(tf.range(n_at_total, dtype=tf.int32), [-1, 1]) < n_at_real
+        total_energy = tf.reduce_sum(
+            tf.where(real, e_atomic, tf.zeros_like(e_atomic)), axis=0, keepdims=True
+        )
         nat = tf.shape(input_data[constants.ATOMIC_MU_I])[0]
         total_f = tf.math.unsorted_segment_sum(
             pair_f, input_data[constants.BOND_IND_J], num_segments=nat
