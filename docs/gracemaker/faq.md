@@ -182,6 +182,7 @@ the full bisection across toolchains.
 | `grace/2layer/parallel` | 2-layer | yes | yes | — | always |
 | `grace/1l/kk` | 1-layer | no | yes | yes (Kokkos) | always |
 | `grace/2l/kk` | 2-layer | no | yes | yes (Kokkos) | always |
+| `grace/3l/kk` | 3-layer | no | yes | yes (Kokkos) | always |
 | `grace/fs` | FS | no | yes | — | always |
 | `grace/fs/kk` | FS | no | yes | yes (Kokkos) | always |
 
@@ -194,7 +195,8 @@ and run TensorFlow-free.
 
 ## How to run GRACE models in parallel in LAMMPS?
 
-**Single-layer models** — use `grace/1layer/chunk` and assign one GPU per MPI rank:
+**Single-layer models** — use `grace` (or `grace/1layer/chunk` for large structures
+and guaranteed virials) and assign one GPU per MPI rank:
 
 ```bash
 mpirun -np 4 --bind-to none bash -c \
@@ -227,35 +229,69 @@ Alternatively, use `grace/1layer/chunk`, `grace/2layer/chunk`, or `grace/2layer/
 
 ---
 
-## How to evaluate uncertainty indication for GRACE models?
+## How to evaluate uncertainty (extrapolation grade `gamma`) for GRACE models?
 
-**For all GRACE models:** Use naive ensembling (query-by-committee). Run parameterization with different seeds, e.g.,
+Use the per-atom extrapolation grade **`gamma`** — the single UQ signal
+reported by GRACE models. It is the Mahalanobis distance of an atomic
+environment to its nearest GMM cluster in the model's own latent space,
+normalized by a calibrated per-cluster threshold, so it is dimensionless:
+
+* $\gamma \lesssim 1$ — the environment lies inside the training distribution.
+* $\gamma \approx 1$ — the atom sits at the boundary of the training distribution.
+* $\gamma \gg 1$ — extrapolation; treat the prediction as unreliable.
+
+**GRACE-1L/2L/3L models** need a GMM-UQ artifact, built once from the training
+set with [`grace_uq build`](../uq/#grace_uq-build):
 
 ```bash
-gracemaker ... --seed 1
-gracemaker ... --seed 2
+grace_uq build --model-yaml model.yaml \
+               --checkpoint checkpoints/checkpoint.best_test_loss.index \
+               --train-data training_set.pkl.gz \
+               --artifact-path UQ/gmm_artifacts.npz
 ```
 
-This generates multiple models in `seed/{number}/`. Use these models with the ASE calculator:
+Alongside the artifact this writes a `saved_model/` with UQ baked in — just
+load it with the usual calculator and read `gamma` from the results:
 
 ```python
 from tensorpotential.calculator import TPCalculator
 
-calc_ens = TPCalculator(model=[
-    "fit/seed/1/saved_model/",
-    "fit/seed/2/saved_model/",
-    "fit/seed/3/saved_model/",
-])
-
-at.calc = calc_ens
+at.calc = TPCalculator(model="UQ/saved_model")
 at.get_potential_energy()
-
-calc.results['energy_std']  # Standard deviation of total energy predictions
-calc.results['forces_std']  # Standard deviation of forces predictions
-calc.results['stress_std']  # Standard deviation of stress predictions
+at.calc.results["gamma"]         # per-atom extrapolation grades
+at.calc.results["atomic_sigma"]  # raw, unnormalized Mahalanobis distances
 ```
 
-**For GRACE/FS models:** In addition to the ensembling method, use extrapolation grades based on D-optimality in [ASE](../quickstart/#gracefs_1) and [LAMMPS](../quickstart/#lammps-gracefs).
+UQ is detected and enabled automatically; call `calc.disable_uq()` if you want
+the faster non-UQ path (and `calc.enable_uq()` to switch back).
+
+!!! tip "Foundation models often ship UQ already"
+    Many distributed models come with `gmm_artifacts.npz` and a UQ head — no
+    build step needed. Check the **UQ** column in the
+    [foundation models](../foundation/) tables.
+
+**GRACE/FS models** use extrapolation grades based on D-optimality instead:
+[build an active set (ASI)](../quickstart/#build-active-set-for-gracefs-only),
+then read `gamma` from
+[`PyGRACEFSCalculator`](../quickstart/#gracefs_1) in ASE or from
+[`pair_style grace/fs extrapolation`](../quickstart/#lammps-gracefs) in LAMMPS.
+
+**Screening datasets and active learning:** `grace_uq predict` evaluates
+energies/forces/stresses plus per-atom γ over a whole dataset, and
+`grace_uq select` picks N structures from a candidate pool by
+extrapolation/diversity strategy.
+
+**In LAMMPS** with the Kokkos pair styles, bake the artifact into the weights
+file with
+[`export_kokkos --uq-artifacts`](../utilities/#baking-in-uq-uncertainty-quantification-artifacts) —
+γ is then computed from the same `.npz` at runtime, with no separate UQ file.
+
+For a model without a UQ artifact — or for a second, independent opinion — you
+can also fit several models with different seeds and use their spread:
+see [ensembling (query-by-committee)](../uq/#alternative-ensembling-query-by-committee).
+
+See the [Uncertainty Quantification](../uq/) page for the full pipeline,
+options, and the Python API.
 
 ---
 

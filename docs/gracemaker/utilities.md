@@ -22,35 +22,103 @@ options:
 
 ___
 
-## `grace_models`
-Utility to download (all) foundation models
+## `extxyz2df`
+
+Utility to convert a dataset in extended XYZ format into the compressed
+`pandas.DataFrame` (`.pkl.gz`) format used for fitting.
 
 ```
-usage: grace_models [-h] {list,download} ...
-
-Download foundational GRACE models
+usage: extxyz2df [-h] [--output-dataset-filename OUTPUT_DATASET_FILENAME] extxyz_filename
 
 positional arguments:
-  {list,download}  Sub-command help
-    list           List available models
-    download       Download a model
+  extxyz_filename       Name of extxyz file
 
 options:
-  -h, --help       show this help message and exit
+  -h, --help            show this help message and exit
+  --output-dataset-filename OUTPUT_DATASET_FILENAME
+                        pickle filename, default is inferred from extxyz_filename
+```
+
+```bash
+extxyz2df train.xyz            # -> train.pkl.gz
+```
+
+Energies, forces and stresses are taken from the extxyz file; the resulting
+DataFrame has the columns described in [Data Collection](../quickstart/#data-collection).
+Pass `--output-dataset-filename` to name the output explicitly.
+
+___
+
+## `df2extxyz`
+
+The reverse conversion: from a `.pkl.gz` DataFrame back to extended XYZ, useful
+for inspecting or sharing a dataset with other tools.
 
 ```
+usage: df2extxyz [-h] [-e ENERGY_COLUMN] [-f FORCE_COLUMN] [-s STRESS_COLUMN] [-o OUTPUT] input
+
+positional arguments:
+  input                 input pkl.gz file
+
+options:
+  -h, --help            show this help message and exit
+  -e, --energy-column ENERGY_COLUMN
+                        name of energy column (default: energy_corrected)
+  -f, --force-column FORCE_COLUMN
+                        name of forces column (default: forces)
+  -s, --stress-column STRESS_COLUMN
+                        name of stress column (default: stress)
+  -o, --output OUTPUT   output file name
+```
+
+```bash
+df2extxyz train.pkl.gz -o train.extxyz
+```
+
+___
+
+## `grace_models`
+Utility to list, inspect and download foundation models
+
+```
+usage: grace_models [-h] {list,info,download,checkpoint} ...
+
+Download foundation GRACE models
+
+positional arguments:
+  {list,info,download,checkpoint}
+                        Sub-command help
+    list                List available models
+    info                Show declared + downloaded-artifact capability flags for a model
+    download            Download a model
+    checkpoint          Download a checkpoint
+
+options:
+  -h, --help            show this help message and exit
+
+```
+
+| Subcommand | Purpose |
+| :--- | :--- |
+| `list` | Compact capability table of all available models. `-v`/`--verbose` prints the full per-model block (description, paths, license); `--ascii` uses ASCII glyphs instead of unicode. |
+| `info <model>` | Declared capability flags (precision, UQ, parallel) for one model, plus introspection of the artifact if it is already downloaded. |
+| `download <model>` | Download a model (`all` downloads every model). `--kokkos` also fetches its LAMMPS-Kokkos export (`kokkos.npz`) into the model directory. |
+| `checkpoint <model>` | Download only the checkpoint (needed for fine-tuning). |
 
 Example:
 ```bash
-grace_models
+grace_models list
 ```
+
+See [foundation models](../foundation/#downloading-foundation-models) for the
+model tables and the cache location.
 ___
 
 ## `grace_utils`
 Utility to convert, export and summarize GRACE models
 
 ```
-usage: grace_utils [-h] -p POTENTIAL [--param_dtype float32] [-c CHECKPOINT_PATH] [-os OUTPUT_SUFFIX] {update_model,resave_checkpoint,reduce_elements,cast_model,export,export_kokkos,summary,aux_model} ...
+usage: grace_utils [-h] -p POTENTIAL [--param_dtype float32] [-c CHECKPOINT_PATH] [-os OUTPUT_SUFFIX] {update_model,resave_checkpoint,reduce_elements,cast_model_param,export,export_kokkos,summary,aux_model} ...
 
 CLI tool for model conversions and summarization
 
@@ -170,10 +238,11 @@ grace_utils -p /path/to/model.yaml -c /path/to/checkpoint/checkpoint.index expor
 
 #### Export to .npz for LAMMPS Kokkos pair style
 
-GRACE-1L and GRACE-2L models can be exported to a self-contained `.npz` blob
-that the `pair_grace_1l_kokkos` / `pair_grace_2l_kokkos` LAMMPS pair styles
-read directly — no TensorFlow at LAMMPS runtime. The architecture (1L vs 2L)
-is auto-detected from the model's instructions.
+GRACE-1L, GRACE-2L and GRACE-3L models can be exported to a self-contained
+`.npz` blob that the `pair_grace_1l_kokkos` / `pair_grace_2l_kokkos` /
+`pair_grace_3l_kokkos` LAMMPS pair styles read directly — no TensorFlow at
+LAMMPS runtime. The architecture (1L, 2L or 3L) is auto-detected from the
+model's instructions.
 
 ```bash
 grace_utils -p /path/to/model.yaml -c /path/to/checkpoint/checkpoint.index export_kokkos -o grace_weights.npz
@@ -182,12 +251,12 @@ grace_utils -p /path/to/model.yaml -c /path/to/checkpoint/checkpoint.index expor
 Use the resulting file in your LAMMPS input as:
 
 ```
-pair_style grace/1l/kk    # or grace/2l/kk
+pair_style grace/1l/kk    # or grace/2l/kk, grace/3l/kk
 pair_coeff * * grace_weights.npz <element1> <element2> ...
 ```
 
 !!! warning "Standard architectures only"
-    `grace/1l/kk` and `grace/2l/kk` only support the standard GRACE-1L / 2L
+    The Kokkos pair styles only support the standard GRACE-1L / 2L / 3L
     architectures from the built-in [presets](../presets/) and
     [foundation models](../foundation/). Models with non-standard instructions,
     unsupported activations, or dimensions above the LAMMPS compile-time caps
@@ -195,7 +264,7 @@ pair_coeff * * grace_weights.npz <element1> <element2> ...
     TensorFlow-based pair styles (`grace`, `grace/2layer/parallel`, …) or
     GRACE-FS instead.
 
-Use `--arch 1l` / `--arch 2l` to override architecture auto-detection.
+Use `--arch 1l` / `--arch 2l` / `--arch 3l` to override architecture auto-detection.
 
 ##### Baking in UQ (uncertainty quantification) artifacts
 
@@ -222,6 +291,10 @@ The same `.npz` works with three runtime-precision variants of the pair style
 - `grace/{1l,2l}/kk`        — full fp64 (default)
 - `grace/{1l,2l}/kk/mixed`  — geometry in fp64, NN math in fp32
 - `grace/{1l,2l}/kk/fp32`   — everything in fp32
+
+The 3L models are natively fp32: `grace/3l/kk` is the mixed-precision style
+(geometry in fp64) and `grace/3l/kk/fp32` runs everything in fp32; there is no
+fp64 3L variant.
 
 Empirically, `fp32` and `mixed` agree with `fp64` to roughly **1e-6 relative
 precision** on energies and forces — well within typical MD requirements.
