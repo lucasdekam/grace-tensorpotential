@@ -50,7 +50,7 @@ Given the feature vector **z** above for an atom of element *e*:
 
     $$\gamma = \frac{\sigma}{\theta_{e,k^*}}$$
 
-Here $\theta_{e,k}$ is a robust upper fence on the training sigma for cluster *k* of element *e*, computed as $\mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ (a tail-immune ~3-sigma bound; deliberately *not* a p99 quantile, so a heavy outlier tail can't inflate the threshold and leave the bulk over-lenient). $\gamma \approx 1$ means the atom is at the boundary of the training distribution; $\gamma \gg 1$ indicates an out-of-distribution environment. `gamma` is the sole UQ signal — the dimensionless extrapolation grade used for screening, active learning, and HAL.
+Here $\theta_{e,k}$ is a robust upper fence on the training sigma for cluster *k* of element *e*, computed as $\mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ (a tail-immune ~3-sigma bound; by default deliberately *not* a p99 quantile, so a heavy outlier tail can't inflate the threshold and leave the bulk over-lenient — see [Calibrating the threshold](#calibrating-the-threshold) if a large fraction of your *training* set reads $\gamma > 1$). $\gamma \approx 1$ means the atom is at the boundary of the training distribution; $\gamma \gg 1$ indicates an out-of-distribution environment. `gamma` is the sole UQ signal — the dimensionless extrapolation grade used for screening, active learning, and HAL.
 
 The pipeline has two stages:
 
@@ -120,6 +120,7 @@ No `--train-data` is needed — only the model and existing artifacts.
 | `--filter-fn` | Dotted import path `module.path:function_name` to a callable `filter_atoms(ase.Atoms) -> bool`. False-returning structures are dropped during ingest, before `--frac` subsampling. The module must be importable on the worker's `PYTHONPATH`. Pickle/df shards only. See [Structure filtering](#structure-filtering). |
 | `--n-workers` | Number of parallel processes to spawn for feature extraction and accumulation (default: 1). |
 | `--n-clusters` | Number of clusters per chemical element (default: `1 2 4 8 16`). Pass a single value to use it directly, or multiple values to run the elbow method and automatically select the optimal k. |
+| `--threshold-percentile` | Calibrate gamma so that `gamma = 1` sits at the Q-th percentile of each cluster's training sigma histogram (Q in (0, 100]), instead of the default `median + 3*(1.4826*MAD)` outlier fence. Use when a large fraction of your *training* set reads `gamma > 1`. Gamma is **not** comparable with artifacts built the default way — see [Calibrating the threshold](#calibrating-the-threshold). |
 | `--max-neighbours-per-batch` | Target number of neighbour pairs per batch for streaming (pickle) input (default: 15000). Controls GPU memory usage. Ignored for sharded TF datasets (batches are pre-padded). |
 | `--frac` | Float (0.0 to 1.0). Use a random fraction of the training data to speed up artifact generation. |
 | `--seed` | Random seed for data shuffling and KMeans initialization (default: 42). |
@@ -152,7 +153,7 @@ Effects on the pipeline:
 
 -   **Step 1** (centroid placement): atoms are weighted in `MiniBatchKMeans.partial_fit(sample_weight=...)`, so KMeans centroids are pulled toward heavily-weighted sources.
 -   **Step 2** (covariance): per-cluster scatter accumulates `(w·δ)ᵀ δ` and the effective count accumulates `Σ w`; the covariance divisor is the effective count, not the raw atom count.
--   **Step 3** (thresholds): the master computes both a raw robust-threshold matrix (`interp_thresholds`) and an effective (weighted) one (`eff_interp_thresholds`), each the per-cluster $\mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ fence on its histogram. The raw atom count still drives the `min_atoms_for_p99` reliability gate — statistical confidence depends on sample size, not weight. Both matrices are persisted; inference prefers the effective thresholds when present.
+-   **Step 3** (thresholds): the master computes both a raw robust-threshold matrix (`interp_thresholds`) and an effective (weighted) one (`eff_interp_thresholds`), each the per-cluster $\mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ fence on its histogram (or the Q-th percentile of it, with `--threshold-percentile Q`). The raw atom count still drives the `min_atoms_for_p99` reliability gate — statistical confidence depends on sample size, not weight. Both matrices are persisted; inference prefers the effective thresholds when present.
 -   **Bit-exact back-compat**: `--train-data-weighted 1.0 ...` produces an artifact identical (to floating-point round-off) to the equivalent `--train-data ...` build. The fast path in the hot loops skips the `sample_weight=` kwarg, the `w·δ` multiply, and the second weighted bincount whenever every atom in a batch carries weight 1.0.
 -   **Diagnostics**: `grace_uq info` shows an extra `eff_count` column (and `eff_thr_med`) when they diverge from the raw values. Each artifact also stores both `counts_{e}` and `effective_count_{e}` per element, plus `hist_{e}` (raw int64) and `eff_hist_{e}` (weighted float64), so the artifact can be inspected from either side.
 
@@ -211,7 +212,7 @@ Each of steps 1–3 splits the training data across `--n-workers` parallel proce
 
 3.  **Threshold Calibration**:
     -   Each worker evaluates the Mahalanobis distance $\sigma$ for every atom in its data shard using the finalized centroids and inverse covariances, and accumulates per-element, per-cluster **histograms** of $\sigma$ values (250 bins over [0, 100]). When `--train-data-weighted` is in effect a parallel weighted histogram is also accumulated.
-    -   The master sums histograms across workers and computes the **robust threshold** $\sigma$ for each cluster: $\theta_{e,k} = \mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ of $\sigma$ over element *e*, cluster *k* (a tail-immune ~3-sigma fence, not a tail quantile). Clusters whose raw atom count is below the reliability floor (`min_atoms_for_p99`) inherit the element-wide maximum threshold; the gate uses the raw count regardless of weighting, since statistical confidence depends on sample size. Under weighting a second robust threshold is computed from the weighted histogram and saved as `eff_interp_thresholds`; inference prefers it when present.
+    -   The master sums histograms across workers and computes the **robust threshold** $\sigma$ for each cluster: $\theta_{e,k} = \mathrm{median} + 3 \cdot (1.4826 \cdot \mathrm{MAD})$ of $\sigma$ over element *e*, cluster *k* (a tail-immune ~3-sigma fence, not a tail quantile — unless `--threshold-percentile Q` is given, which makes it exactly that). Clusters whose raw atom count is below the reliability floor (`min_atoms_for_p99`) inherit the element-wide maximum threshold; the gate uses the raw count regardless of weighting, since statistical confidence depends on sample size. Under weighting a second robust threshold is computed from the weighted histogram and saved as `eff_interp_thresholds`; inference prefers it when present.
     -   Generates the final artifact file (default: `gmm_artifacts.npz`).
 
 4.  **SavedModel Export** (default, skip with `--no-export`):
@@ -238,6 +239,34 @@ These arguments are typically managed by the master process but can be used for 
 | `--step2-artifacts` | Path to merged Step 2 artifacts (covariances). |
 
 ---
+
+## Calibrating the threshold
+
+`gamma = 1` is a **3-sigma outlier fence**, so on a well-behaved training set only ~0.1% of training
+atoms should exceed it. If far more than that do — 10-20% is possible — the per-cluster sigma
+distribution is a sharp spike plus a heavy tail: MAD measures only the spike width, the fence lands
+just above it, and everything in the tail is flagged. That usually means the clusters are too coarse
+and genuinely different environments are sharing one cluster, so try more clusters first
+(`--n-clusters`, passing a *single* value to bypass the elbow search).
+
+When that is not enough, `--threshold-percentile Q` pins the threshold to the Q-th percentile of each
+cluster's training sigma histogram instead:
+
+```bash
+grace_uq build ... --threshold-percentile 99     # at most ~1% of training atoms above gamma = 1
+```
+
+The bound is one-sided ("at most"): backfilled clusters take the element-wide max threshold and
+saturated ones clamp at the histogram ceiling, both more lenient; and under `--train-data-weighted`
+the quantile is over training *weight*, not atom count.
+
+**This changes what `gamma = 1` means** — a calibration statement about your training set, rather than
+an outlier fence — so gamma values are **not comparable** with artifacts built the default way. The
+artifact records which estimator ran; `grace_uq info` prints it as `threshold estimator`. Note the
+trade-off the default exists to avoid: on a heavy tail the quantile rides that tail, so the bulk can
+read `gamma ~ 0.01` and ordinary atoms never approach 1. `grace_uq info` warns when it detects this.
+
+
 
 ## Python API
 

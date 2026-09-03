@@ -107,6 +107,14 @@ class RandomProjectedBasisFeatures(TPInstruction):
     # reproduce their exact feature at load time.
     _FEATURE_TRANSFORMS = (None, "asinh")
 
+    # See :meth:`_safe_norm`. Bounded on BOTH sides — do not "tighten" it:
+    #   lower — must stay a *normal* float32 (>= 1.18e-38). Models run float32 and XLA
+    #     flushes a subnormal constant to zero, silently restoring the NaN this guards
+    #     against (measured: 1e-38 and below already fail).
+    #   upper — sqrt(floor) must stay well under ``_eps``, added to the norms directly
+    #     afterwards; at 1e-30 that is 1e-15 vs 1e-12.
+    _NORM_FLOOR = 1e-30
+
     def __init__(
         self,
         basis_reduce_instructions,
@@ -178,6 +186,32 @@ class RandomProjectedBasisFeatures(TPInstruction):
             self.float_dtype = float_dtype
             self.is_built = True
 
+    def _safe_norm(self, x, keepdims: bool = False):
+        """Row-wise L2 norm whose gradient is finite at ``x == 0``.
+
+        ``tf.norm``'s gradient is ``div_no_nan``-guarded in eager/graph mode, but
+        under ``jit_compile=True`` (how the compute function always runs) the guard
+        is simplified away and a zero row differentiates to 0/0 = NaN. Padded
+        batches always contain such a row: the fake atom's bonds are all dummies
+        beyond the cutoff, so the envelope zeros its entire basis. Since the UQ
+        objectives mask padded atoms with a *multiplicative* zero, ``0 * NaN`` keeps
+        the NaN and smears it over every padded bond, poisoning any quantity
+        contracted over all bonds (``virial_sigma``). A real atom with no neighbour
+        inside the cutoff (evaporated / isolated) hits the same zero basis.
+
+        Folding a tiny constant under the sqrt keeps the derivative bounded
+        (``x / sqrt(Σx² + tiny)`` → 0 at ``x == 0``) — the same trick
+        :class:`~tensorpotential.instructions.compute.BondLength` uses. Features of
+        stored artifacts are reproduced bit-for-bit (verified in float32 and float64):
+        the floor is far below the ``_eps`` added to the norms downstream, so it is
+        invisible for any non-zero basis. A zero basis — only ever the padding or an
+        isolated atom, whose feature is meaningless anyway — shifts its density
+        channel by ~1e-3, from ``log(_eps)`` to ``log(sqrt(floor) + _eps)``.
+        """
+        return tf.sqrt(
+            tf.reduce_sum(x * x, axis=-1, keepdims=keepdims) + self._NORM_FLOOR
+        )
+
     def _apply_feature_transform(self, basis):
         """Non-linear transform of the basis before the matmul: ``proj = T(basis) @ R``.
 
@@ -214,14 +248,14 @@ class RandomProjectedBasisFeatures(TPInstruction):
         dens = None
         if self.add_density_channel:
             norms = tf.stack(
-                [tf.norm(basis, axis=-1)] + [tf.norm(b, axis=-1) for b in blocks],
+                [self._safe_norm(basis)] + [self._safe_norm(b) for b in blocks],
                 axis=-1,
             )
             dens = tf.math.log(norms + self._eps) * tf.constant(
                 self.density_scale, dtype=dtype
             )
         if self.normalize:
-            basis = basis / (tf.norm(basis, axis=-1, keepdims=True) + self._eps)
+            basis = basis / (self._safe_norm(basis, keepdims=True) + self._eps)
         basis = self._apply_feature_transform(basis)
         proj = tf.matmul(basis, self.projection)
         if dens is not None:

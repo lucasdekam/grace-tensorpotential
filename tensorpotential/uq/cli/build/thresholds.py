@@ -130,6 +130,35 @@ def _robust_threshold_from_hist(h, bins, bw):
     return median + _ROBUST_K * sigma_hat
 
 
+def _percentile_threshold_from_hist(h, bins, bw, q):
+    """Tail-quantile threshold: the ``q``-th percentile of the sigma histogram.
+
+    OPT-IN alternative to the robust ``median + k*MAD`` estimator, selected with
+    ``grace_uq build --threshold-percentile Q``. Read the block comment above
+    ``_ROBUST_K`` before using it: on a spike + heavy-tail sigma distribution a
+    quantile RIDES the tail, so the bulk can read gamma ~ 0.01 and ordinary
+    atoms never approach gamma = 1 (the over-lenient GRACE-2L-SMAX failure).
+
+    It is the right choice when you want ``gamma = 1`` to mean "at most the
+    (100-q)% most extrapolatory fraction of the TRAINING set" — a calibration
+    statement rather than an outlier fence. The bound is one-sided: backfilled
+    clusters take the element-wide max threshold and saturated ones clamp at the
+    histogram ceiling, both more lenient; and under weighting the quantile is
+    over training WEIGHT, not atom count. That makes the training
+    gamma distribution self-consistent at the cost of comparability with models
+    built using the default estimator.
+
+    Uses the same bin-size-proof piecewise-linear CDF as the median, so the
+    value is independent of the histogram grid.
+    """
+    if not (0.0 < q <= 100.0):  # NaN-safe: NaN fails the membership test
+        raise ValueError(f"threshold percentile must be in (0, 100], got {q}")
+    h, s, c_before = _hist_cdf_parts(h)
+    if s <= 0:
+        return np.nan
+    return _interp_quantile(h, s, c_before, bins, bw, q / 100.0)
+
+
 def _p99_midpoint_from_hist(h, bins, bw):
     """p99 as the MIDPOINT of the bin holding it.
 
@@ -156,12 +185,16 @@ def _compute_dual_thresholds(
     n_clusters: int,
     min_atoms_for_threshold: int,
     n_elements: int,
+    threshold_percentile: float | None = None,
 ):
     """Compute raw + effective per-cluster sigma threshold matrices in lockstep.
 
-    The threshold VALUE is the robust ``median + k*(1.4826*MAD)`` estimator (see
-    the block comment above ``_ROBUST_K``), NOT a tail quantile — so a heavy
-    outlier tail can't set the boundary and leave the bulk over-lenient.
+    The threshold VALUE defaults to the robust ``median + k*(1.4826*MAD)``
+    estimator (see the block comment above ``_ROBUST_K``), NOT a tail quantile —
+    so a heavy outlier tail can't set the boundary and leave the bulk
+    over-lenient. ``threshold_percentile=Q`` opts into the Q-th percentile of
+    the sigma distribution instead (see ``_percentile_threshold_from_hist``);
+    only the cell VALUES change, the reliability gate is untouched.
 
     Both matrices share reliability mask and backfill positions: the raw atom
     count drives the ``min_atoms_for_threshold`` gate (statistical confidence is
@@ -195,6 +228,18 @@ def _compute_dual_thresholds(
     bin_width = bins[1] - bins[0]
     underpop_warnings: list = []
 
+    def _threshold_from_hist(h):
+        """The selected threshold estimator, for one histogram.
+
+        Default: robust median + k*MAD (see _ROBUST_K). --threshold-percentile
+        swaps in a tail quantile; the reliability GATE below is deliberately
+        left on the p99 midpoint either way, so the reliable-cluster SET and
+        every backfill decision are unchanged.
+        """
+        if threshold_percentile is None:
+            return _robust_threshold_from_hist(h, bins, bin_width)
+        return _percentile_threshold_from_hist(h, bins, bin_width, threshold_percentile)
+
     raw_thresh = np.full((n_elements, n_clusters), np.nan, dtype=np.float64)
     eff_thresh = np.full((n_elements, n_clusters), np.nan, dtype=np.float64)
     reliable_mask = np.zeros((n_elements, n_clusters), dtype=bool)
@@ -204,14 +249,12 @@ def _compute_dual_thresholds(
         for k in range(n_clusters):
             h_raw = h_raw_full[k]
             n_calib = int(h_raw.sum())
-            # Threshold VALUE: robust median + k*MAD on each histogram (see the
-            # block comment above _ROBUST_K). The effective (weighted) histogram
-            # drives the threshold inference uses when weights are non-trivial.
-            raw_thresh[e, k] = _robust_threshold_from_hist(h_raw, bins, bin_width)
+            # Threshold VALUE, from the selected estimator (see
+            # _threshold_from_hist). The effective (weighted) histogram drives
+            # the threshold inference uses when weights are non-trivial.
+            raw_thresh[e, k] = _threshold_from_hist(h_raw)
             eff_thresh[e, k] = (
-                _robust_threshold_from_hist(h_eff_full[k], bins, bin_width)
-                if h_eff_full is not None
-                else np.nan
+                _threshold_from_hist(h_eff_full[k]) if h_eff_full is not None else np.nan
             )
             # Reliability GATE (deliberately unchanged from the midpoint era):
             # raw-sample confidence AND not-too-concentrated. The gate still uses
