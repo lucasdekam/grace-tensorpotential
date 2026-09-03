@@ -55,7 +55,7 @@ They offer the best balance of structural robustness (from SMAX) and high-precis
 
 ## OMAT models
 
-Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1), [arXiv](https://arxiv.org/abs/2508.17936)
+Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1) (open access)
 
 The base models (**-OMAT**) are trained on the [OMat24](https://huggingface.co/datasets/fairchem/OMAT24#omat24-dataset) dataset.
 The fine-tuned versions (**-OMAT-ft-E**) are derived from these base models by fine-tuning with more emphasis on energies.
@@ -64,15 +64,15 @@ The fine-tuned versions (**-OMAT-ft-E**) are derived from these base models by f
 
 ### Three-layer (3L) models
 
-Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1), [arXiv](https://arxiv.org/abs/2508.17936)
+Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1) (open access)
 
 The **three-layer (3L)** GRACE models add a third message-passing layer for a larger
-effective receptive field. Both use a fixed **6 Å cutoff** and ship with UQ. They are
+effective receptive field. The 3L models use a fixed **6 Å cutoff** and ship with UQ. They are
 natively **fp32** (there is no `-fp64` variant). For LAMMPS-Kokkos use
 `pair_style grace/3l/kk` (mixed precision) or `pair_style grace/3l/kk/fp32`.
 
-| Model Name | Full Name | Size |  $\kappa_\mathrm{SRME}$ | UQ | Kokkos | Description |
-|:--- |:--- |:--- |:------|:-----------------------|:---|:---| :--- |
+| Model Name              | Full Name | Size | $\kappa_\mathrm{SRME}$ | UQ | Kokkos | Description |
+|:------------------------| :--- | :--- |:-----------------------|:---|:---| :--- |
 | **GRACE-3L-OMAT-large** | GRACE-3L-OMAT-large | large | 0.141 | ✓ | ✓ | Three-layer, trained on OMat24 |
 
 
@@ -102,20 +102,22 @@ natively **fp32** (there is no `-fp64` variant). For LAMMPS-Kokkos use
 
 ## OAM models
 
-Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1), [arXiv](https://arxiv.org/abs/2508.17936)
+Reference: [npj Comp. Mat.](https://www.nature.com/articles/s41524-026-01979-1) (open access)
 
 These models are first pre-trained on **OMat24** and then fine-tuned on a combination of the [sAlex](https://huggingface.co/datasets/fairchem/OMAT24#salex-dataset) dataset (10.4M structures) and the [MPtraj](https://figshare.com/articles/dataset/Materials_Project_Trjectory_MPtrj_Dataset/23713842?file=41619375) dataset (1.58M structures).
 
 ### Three-layer (3L) models
 
 The **three-layer (3L)** GRACE models add a third message-passing layer for a larger
-effective receptive field. Both use a fixed **6 Å cutoff** and ship with UQ. They are
+effective receptive field. The 3L models use a fixed **6 Å cutoff** and ship with UQ. They are
 natively **fp32** (there is no `-fp64` variant). For LAMMPS-Kokkos use
 `pair_style grace/3l/kk` (mixed precision) or `pair_style grace/3l/kk/fp32`.
 
-| Model Name | Full Name | Size | F1 | $\kappa_\mathrm{SRME}$ | UQ | Kokkos | Description |
-|:--- |:--- |:--- |:------|:-----------------------|:---|:---| :--- |
+
+| Model Name | Full Name | Size | F1    | $\kappa_\mathrm{SRME}$ | UQ | Kokkos | Description |
+| :--- |:--- | :--- |:------| :--- |:---|:---| :--- |
 | **GRACE-3L-OMAT-large-ft-AM** | GRACE-3L-OMAT-large-ft-AM | large | 0.925 | **0.121** | ✓ | ✓ | Three-layer, fine-tuned on sAlex + MPtraj |
+
 
 ### Two-layer (2L), semilocal models
 
@@ -167,7 +169,7 @@ You can generate an `input.yaml` file for fine-tuning a foundation model by runn
 ### Manual setup
 
 Fine-tuning foundation GRACE models can only be performed using checkpoints, not saved models.
-Run `grace_models list` to view the available models that include a `CHECKPOINT:` field.
+Run `grace_models list -v` to view the available models that include a `CHECKPOINT:` field (or `grace_models info <MODEL-NAME>` for a single model).
 You can either download this checkpoint manually using `grace_models checkpoint <MODEL-NAME>`, or it will be downloaded automatically when needed.
 
 To fine-tune a foundation model, add the following to the `potential` section of your `input.yaml`:
@@ -261,7 +263,7 @@ You need to create a `$HOME/.cache/grace/models_registry.yaml` file with a conte
 
 ```yaml
 FULL-MODEL-NAME:
-  path: /path/to/saved_mode
+  path: /path/to/saved_model
   checkpoint_path: /path/to/checkpoint/  # model.yaml and checkpoint.index should be in this folder
   description: some description
   license: some license
