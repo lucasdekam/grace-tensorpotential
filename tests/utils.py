@@ -10,6 +10,50 @@ from tensorpotential.cli.gracemaker import main
 from tensorpotential.utils import load_metrics
 
 
+def build_tf_batch(
+    atoms, element_map, specs, cutoff=6.0, pad_atoms=0, pad_bonds=0, float_dtype=None
+):
+    """Single-structure batch as model-ready TF tensors, optionally padded.
+
+    ``specs`` is a model's ``compute_specs``; only the keys it declares are
+    converted and returned. ``pad_atoms`` / ``pad_bonds`` append that many fake
+    atoms / dummy bonds, mirroring what ``PaddingManager`` does at inference time
+    (given here as exact counts so callers can slice the padded tail).
+
+    Returns ``(data, n_atoms_real, n_bonds_real)``.
+    """
+    import tensorflow as tf
+    from tensorpotential import constants as tc
+    from tensorpotential.data.databuilder import (
+        GeometricalDataBuilder,
+        get_number_of_real_atoms,
+        get_number_of_real_neigh,
+    )
+
+    float_dtype = float_dtype or tf.float64
+    db = GeometricalDataBuilder(element_map, cutoff=cutoff)
+    batch = db.join_to_batch([db.extract_from_ase_atoms(atoms)])
+    n_atoms_real = get_number_of_real_atoms(batch)
+    n_bonds_real = get_number_of_real_neigh(batch)
+    if pad_atoms or pad_bonds:
+        db.pad_batch(
+            batch,
+            {
+                tc.PAD_MAX_N_ATOMS: n_atoms_real + pad_atoms,
+                tc.PAD_MAX_N_NEIGHBORS: n_bonds_real + pad_bonds,
+                tc.PAD_MAX_N_STRUCTURES: 2,
+            },
+        )
+    data = {
+        k: tf.convert_to_tensor(
+            v, dtype=tf.int32 if specs[k]["dtype"] == "int" else float_dtype
+        )
+        for k, v in batch.items()
+        if k in specs
+    }
+    return data, n_atoms_real, n_bonds_real
+
+
 def print_full(x):
 
     pd.set_option("display.max_rows", None)

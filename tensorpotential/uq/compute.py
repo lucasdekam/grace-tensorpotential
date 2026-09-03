@@ -177,6 +177,13 @@ class ComputeStructureEnergyAndForcesAndVirialAndUncertainty(_GMMUQComputeBase):
         ) - tf.math.unsorted_segment_sum(
             pair_u, input_data[constants.BOND_IND_I], num_segments=nat
         )
+        # Contracts over ALL bonds, padding included — exactly like the physical virial
+        # above, and correct for the same reason: dummy bonds sit beyond the cutoff, so
+        # the envelope zeros their contribution to `pair_u`. This is also the canary:
+        # `uncertainty_forces` parks padded-bond values on the fake atom, where the
+        # caller slices them off, but the virial cannot hide a leak — so a gradient that
+        # is ill-defined for the fake atom's all-zero basis surfaces here as NaN (see
+        # RandomProjectedBasisFeatures._safe_norm).
         virial_sigma = compute_structure_virials_from_pair_forces(pair_u, input_data)
 
         res = self._physical_outputs(input_data, e_atomic, pair_f)

@@ -556,11 +556,21 @@ def run_master(args):
     print("=" * 40)
     if not args.restart and os.path.exists(args.artifact_path):
         print(f"  [Master] {args.artifact_path} already exists. Skipping Step 3.")
+        # Recalibrating an existing artifact is THE use case for this flag, and
+        # skipping step 3 keeps the thresholds it already has. Silently exporting
+        # a SavedModel with the old estimator would be the worst outcome.
+        if getattr(args, "threshold_percentile", None) is not None:
+            print(
+                "  [Master] WARNING: --threshold-percentile was given but step 3 was "
+                f"skipped, so {args.artifact_path} keeps its EXISTING thresholds. "
+                "Delete the artifact (the .step*_final.npz stay, so this is cheap) "
+                "or pass --restart to recalibrate."
+            )
     else:
         spawn_workers(3, ["--step2-artifacts", step2_path])
         print(f"  [Master] Threshold calculation took {time.time() - t0:.1f}s")
 
-        print("  [Master] Computing per-cluster p99 thresholds...")
+        print("  [Master] Computing per-cluster sigma thresholds...")
         total_hists = {}
         total_eff_hists = {}
         for i in range(args.n_workers):
@@ -605,17 +615,28 @@ def run_master(args):
         except Exception:
             pass
 
-        # Compute both thresholds in parallel using the robust median+k*MAD
-        # estimator (see thresholds._ROBUST_K). The raw histogram drives the
-        # reliability gate (sample-count confidence); the effective histogram
-        # drives the threshold inference uses when weights are non-trivial. Both
-        # matrices share the SAME backfill positions so they stay consistent.
+        # Compute both thresholds in parallel, by default with the robust
+        # median+k*MAD estimator (see thresholds._ROBUST_K). The raw histogram
+        # drives the reliability gate (sample-count confidence); the effective
+        # histogram drives the threshold inference uses when weights are
+        # non-trivial. Both matrices share the SAME backfill positions so they
+        # stay consistent.
+        threshold_percentile = args.threshold_percentile
         thresh_matrix, eff_thresh_matrix, underpop_warnings, elementwise_fallback_warnings = (
             _compute_dual_thresholds(
                 total_hists, total_eff_hists, bins, n_clusters,
                 min_atoms_for_threshold, n_elements=len(master_symbols),
+                threshold_percentile=threshold_percentile,
             )
         )
+
+        # Say which estimator ran: gamma is not comparable across the two.
+        if threshold_percentile is not None:
+            print(
+                f"  [Master] thresholds: {threshold_percentile:g}-th percentile of the "
+                "training sigma distribution (--threshold-percentile), NOT the default "
+                "median+3*MAD fence"
+            )
 
         if underpop_warnings:
             print(
@@ -714,12 +735,19 @@ def run_master(args):
             density_scale=uq_constants.UQ_DEFAULT_DENSITY_SCALE,
         )
 
+        # Provenance: which estimator produced the thresholds above.
+        if threshold_percentile is None:
+            threshold_mode = "robust_mad"
+        else:
+            threshold_mode = f"percentile_{threshold_percentile:g}"
+
         gmm_uq.save(
             args.artifact_path,
             interp_thresholds=thresh_matrix,
             eff_interp_thresholds=eff_thresh_matrix,
             element_map=np.array(symbols),
             hist_bins=bins,
+            threshold_mode=np.array(threshold_mode),
             **hist_kwargs,
             **rp_kwargs,
         )
@@ -813,6 +841,21 @@ def build_main(argv=None):
         "(e.g. 1e-8) only if features are clean and you want minimal bias.",
     )
     parser.add_argument(
+        "--threshold-percentile",
+        type=float,
+        default=None,
+        metavar="Q",
+        help="Calibrate gamma so that gamma = 1 sits at the Q-th percentile of each "
+        "cluster's TRAINING sigma histogram (Q in (0, 100]; e.g. 99 puts at most ~1%% of "
+        "training atoms above gamma = 1). Default: unset, which uses the robust "
+        "median + 3*1.4826*MAD outlier fence. Bound is 'at most': backfilled clusters "
+        "take the element-wide max threshold and saturated ones clamp at the histogram "
+        "ceiling, both of which are more lenient; under --train-data-weighted the "
+        "quantile is over training WEIGHT, not atom count. A heavy sigma tail can drag "
+        "the threshold up and leave the bulk over-lenient, so gamma values are NOT "
+        "comparable with artifacts built using the default estimator.",
+    )
+    parser.add_argument(
         "--max-neighbours-per-batch",
         type=int,
         default=15000,
@@ -898,6 +941,17 @@ def build_main(argv=None):
     parser.add_argument("--step1-artifacts", help="Internal")
     parser.add_argument("--step2-artifacts", help="Internal")
     args = parser.parse_args(argv)
+
+    # Q outside (0, 100] silently produces a degenerate threshold: Q<=0 gives
+    # threshold 0 (gamma = sigma/0 = inf), Q>100 clamps to the histogram ceiling
+    # (gamma ~ 0, UQ effectively off). NaN slips through both comparisons, so
+    # test for membership rather than negating an out-of-range test.
+    _q = getattr(args, "threshold_percentile", None)
+    if _q is not None and not (0.0 < _q <= 100.0):
+        parser.error(
+            f"--threshold-percentile must be in (0, 100], got {_q}. "
+            "Typical values: 99 (~1% of training atoms above gamma=1) or 99.9."
+        )
 
     # Snapshot whether the user is using the default --train-data BEFORE we
     # turn paths absolute (the abspath mangling makes a literal-equality

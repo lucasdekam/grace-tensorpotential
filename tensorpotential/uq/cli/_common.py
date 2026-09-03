@@ -200,6 +200,13 @@ def read_artifact_metadata(artifact_path: str) -> dict:
         hist_bins = (
             np.asarray(data["hist_bins"]) if "hist_bins" in data.files else None
         )
+        # Which estimator produced interp_thresholds. Absent on artifacts built
+        # before the option existed, which were all robust median+k*MAD.
+        threshold_mode = (
+            str(np.asarray(data["threshold_mode"]).item())
+            if "threshold_mode" in data.files
+            else "robust_mad"
+        )
         hist_arrays: dict[int, np.ndarray] = {}
         eff_hist_arrays: dict[int, np.ndarray] = {}
         for key in data.files:
@@ -267,6 +274,7 @@ def read_artifact_metadata(artifact_path: str) -> dict:
         "interp_thresholds": interp_thresholds,
         "eff_interp_thresholds": eff_interp_thresholds,
         "hist_bins": hist_bins,
+        "threshold_mode": threshold_mode,
         "hist_arrays": hist_arrays or None,
         "eff_hist_arrays": eff_hist_arrays or None,
         "hist_realigned_elems": sorted(set(hist_realigned)),

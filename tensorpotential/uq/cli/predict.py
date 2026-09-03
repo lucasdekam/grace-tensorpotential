@@ -17,10 +17,10 @@ import time
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from tensorpotential.calculator import predict_structures
 from tensorpotential.uq import constants as uq_constants
 from tensorpotential.uq.cli._common import (
     apply_master_thread_caps,
@@ -83,36 +83,40 @@ def _build_calculator(args):
 # --------------------------------------------------------------------------
 
 
-def _predict_one(at, calc, save_features, raise_errors):
-    at = at.copy()
-    at.calc = calc
-    try:
-        e = at.get_potential_energy()
-        f = at.get_forces()
-        try:
-            s = at.get_stress()
-        except Exception:
-            s = None
-    except Exception as exc:
-        if raise_errors:
-            raise
-        log.warning("predict failed for n_atoms=%d: %s", len(at), exc)
-        return {}
-    out = {
-        "energy_predicted": float(e),
-        "forces_predicted": np.asarray(f),
-        "stress_predicted": np.asarray(s) if s is not None else None,
+def _predict_columns(
+    atoms, calc, save_features, raise_errors, sort_by_natoms=True, progress=None
+):
+    """Dataframe columns for a list of structures, in input order.
+
+    Thin adapter over `predict_structures`: that helper owns the largest-first
+    ordering (so the widest XLA shape compiles once) and the copy/detach
+    discipline; this only renames its output to the `*_predicted` schema the CLI
+    writes. Optional columns are omitted entirely when the model produced none
+    for any structure, because downstream code tests for column PRESENCE (see
+    `select.py`: `if "gamma" not in df.columns`).
+    """
+    extra = [uq_constants.ATOMIC_GAMMA, uq_constants.ATOMIC_SIGMA]
+    if save_features:
+        extra.append(uq_constants.FEATURES)
+    out = predict_structures(
+        atoms,
+        calc,
+        properties=("energy", "forces", "stress"),
+        extra=tuple(extra),
+        sort_by_natoms=sort_by_natoms,
+        on_error="raise" if raise_errors else "warn",
+        progress=progress,
+    )
+    cols = {
+        "energy_predicted": out["energy"],
+        "forces_predicted": out["forces"],
+        "stress_predicted": out["stress"],
     }
-    res = getattr(calc, "results", {}) or {}
-    if uq_constants.ATOMIC_GAMMA in res:
-        out["gamma"] = np.asarray(res[uq_constants.ATOMIC_GAMMA])
-    elif "gamma" in res:
-        out["gamma"] = np.asarray(res["gamma"])
-    if uq_constants.ATOMIC_SIGMA in res:
-        out["sigma"] = np.asarray(res[uq_constants.ATOMIC_SIGMA])
-    if save_features and uq_constants.FEATURES in res:
-        out[uq_constants.FEATURES] = np.asarray(res[uq_constants.FEATURES])
-    return out
+    renamed = {uq_constants.ATOMIC_GAMMA: "gamma", uq_constants.ATOMIC_SIGMA: "sigma"}
+    for key in extra:
+        if any(v is not None for v in out[key]):
+            cols[renamed.get(key, key)] = out[key]
+    return cols
 
 
 def _emit_progress_line(done: int, total: int):
@@ -131,32 +135,38 @@ def run_worker(args, *, progress_emit=None) -> int:
     )
     df = load_dataset_any(args.dataset)
     shard = slice_dataset_for_worker(df, args.worker_id, args.n_workers)
-    if args.sort_by_natoms and "ase_atoms" in shard.columns:
-        shard["_n_atoms"] = shard["ase_atoms"].map(len)
-        shard = shard.sort_values("_n_atoms", ascending=False).drop(columns="_n_atoms")
-        shard = shard.reset_index(drop=True)
     log.info("Worker %d: %d structures assigned", args.worker_id, len(shard))
 
     calc = _build_calculator(args)
 
     total = len(shard)
-    pred_rows = []
     emit = progress_emit if progress_emit is not None else _emit_progress_line
     emit_interval = 1.0
     emit(0, total)
     last_emit = time.monotonic()
-    for done, (_, row) in enumerate(shard.iterrows(), start=1):
-        out = _predict_one(
-            row["ase_atoms"], calc, args.save_features, args.raise_errors
-        )
-        pred_rows.append(out)
+
+    def _progress(done, n):
+        nonlocal last_emit
         now = time.monotonic()
-        if done == total or (now - last_emit) >= emit_interval:
-            emit(done, total)
+        if done == n or (now - last_emit) >= emit_interval:
+            emit(done, n)
             last_emit = now
 
-    pred_df = pd.DataFrame(pred_rows, index=shard.index)
-    out_df = pd.concat([shard.drop(columns=[]), pred_df], axis=1)
+    # `predict_structures` evaluates largest-first internally when asked, and
+    # returns results in the shard's own order — so unlike the previous local
+    # sort, the output rows line up with the input rows.
+    pred_df = pd.DataFrame(
+        _predict_columns(
+            shard["ase_atoms"].tolist(),
+            calc,
+            args.save_features,
+            args.raise_errors,
+            sort_by_natoms=args.sort_by_natoms,
+            progress=_progress,
+        ),
+        index=shard.index,
+    )
+    out_df = pd.concat([shard, pred_df], axis=1)
 
     out_path = os.path.join(
         os.path.dirname(args.output) or ".",
@@ -420,7 +430,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sort-by-natoms",
         action="store_true",
         default=True,
-        help="Sort each worker's shard by descending atom count (default ON).",
+        help="Evaluate each worker's shard largest-structure-first so the widest "
+        "XLA shape is compiled once (default ON). Performance only — output rows "
+        "keep the input order either way.",
     )
     p.add_argument(
         "--no-sort-by-natoms",

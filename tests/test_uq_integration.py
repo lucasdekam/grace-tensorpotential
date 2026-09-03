@@ -208,6 +208,111 @@ def test_hal_compute_integration(uq_setup):
     assert results[uqc.ATOMIC_SIGMA].shape == (len(atoms),)
 
 
+@pytest.fixture(scope="module")
+def uqv6_artifact(uq_setup, tmp_path_factory):
+    """uqv6-style artifact — ``normalize=True`` + log-norm density channels.
+
+    The conftest ``uq_setup`` artifact uses the plain linear basis-RP feature,
+    which computes no norms and so cannot exercise the zero-basis (padded /
+    fake atom) code path that production uqv6 models hit on every call.
+    """
+    # Spelled once: the stored R must come from the same knobs the features were
+    # extracted with, or the artifact no longer reproduces them.
+    uqv6 = dict(rp_dim=16, rp_seed=42, normalize=True, add_density_channel=True)
+    spec = make_basis_rp_spec(uq_setup["model_yaml"], **uqv6)
+    calc = setup_feature_calculator(
+        uq_setup["model_yaml"],
+        uq_setup["checkpoint"],
+        param_dtype=tf.float64,
+        feature_spec={
+            "out_dim": uqv6["rp_dim"],
+            "seed": uqv6["rp_seed"],
+            "normalize": uqv6["normalize"],
+            "add_density_channel": uqv6["add_density_channel"],
+        },
+    )
+    atoms = uq_setup["atoms"][:8]
+    features, element_indices = extract_features_bulk(
+        calc, atoms, element_map=uq_setup["element_map"]
+    )
+    builder = GMMUQArtifactBuilder(n_clusters=2, feature_dim=features.shape[1])
+    stream = [(features, element_indices, np.ones(len(features)))]
+    builder.fit_centroids(stream, verbose=False)
+    builder.accumulate_scatter(stream, verbose=False)
+    path = str(tmp_path_factory.mktemp("uqv6") / "uq_artifacts.npz")
+    builder.save(
+        path,
+        element_map=np.array(list(uq_setup["element_map"].keys())),
+        store_fp32=False,
+        **spec,
+    )
+    return path
+
+
+def test_padding_does_not_poison_virial_sigma(uq_setup, uqv6_artifact):
+    """UQ outputs must be invariant to neighbour-list padding.
+
+    The production calculator always pads (``pad_atoms_number``,
+    ``pad_neighbors_fraction``), which appends a fake atom whose bonds are all
+    dummies beyond the cutoff. Padded bonds must contribute exactly nothing to
+    the uncertainty pair forces, so ``virial_sigma`` — which contracts over ALL
+    bonds, padding included, exactly like the physical virial — must match the
+    unpadded value. Regression test for padded-bond NaNs leaking into
+    ``virial_sigma``: ``dsigma_dr`` hid them (they land on the fake atom and get
+    sliced off), the virial did not.
+    """
+    from tensorpotential.uq.factories import build_uq_compute_from_yaml
+    from .utils import build_tf_batch
+
+    tp_uq, _, _, _ = build_uq_compute_from_yaml(
+        model_yaml=uq_setup["model_yaml"],
+        checkpoint=uq_setup["checkpoint"],
+        gmm_artifact_path=uqv6_artifact,
+        param_dtype=tf.float64,
+    )
+    tp_uq.model.decorate_compute_function()
+
+    def compute(pad_atoms=0, pad_bonds=0):
+        data, n_atoms_real, n_bonds_real = build_tf_batch(
+            uq_setup["atoms"][0],
+            uq_setup["element_map"],
+            tp_uq.model.compute_specs,
+            pad_atoms=pad_atoms,
+            pad_bonds=pad_bonds,
+        )
+        return tp_uq.model.compute(data), n_atoms_real, n_bonds_real
+
+    bare, n_atoms_real, n_bonds_real = compute()
+    padded, _, _ = compute(pad_atoms=10, pad_bonds=40)
+
+    virial_sigma = np.asarray(padded[uqc.VIRIAL_SIGMA])
+    assert np.all(np.isfinite(virial_sigma)), (
+        f"virial_sigma is non-finite under padding: {virial_sigma}"
+    )
+    # Padded bonds sit beyond the cutoff -> zero uncertainty pair force.
+    pair_u = np.asarray(padded[uqc.DSIGMA_DR_PAIR])
+    np.testing.assert_array_equal(pair_u[n_bonds_real:], 0.0)
+    # ... hence every UQ output matches the unpadded computation. Tolerances are
+    # loose enough for XLA to reorder reductions between the two batch shapes;
+    # a padded-bond leak would be off by orders of magnitude (dummy bonds are
+    # 52 A long), not by rounding.
+    np.testing.assert_allclose(
+        virial_sigma, np.asarray(bare[uqc.VIRIAL_SIGMA]), rtol=1e-8, atol=1e-8
+    )
+    np.testing.assert_allclose(
+        np.asarray(padded[uqc.DSIGMA_DR])[:n_atoms_real],
+        np.asarray(bare[uqc.DSIGMA_DR]),
+        rtol=1e-8,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        np.asarray(padded[uqc.ATOMIC_SIGMA])[:n_atoms_real],
+        np.asarray(bare[uqc.ATOMIC_SIGMA]),
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
+
 def test_gamma_only_mode_drops_dsigma_dr_keys(uq_setup):
     """When ``compute_dsigma_dr=False`` the calculator must still expose
     energy/forces/sigma but should NOT compute DSIGMA_DR/VIRIAL_SIGMA, and
