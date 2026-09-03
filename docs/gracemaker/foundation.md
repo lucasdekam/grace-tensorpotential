@@ -152,6 +152,10 @@ You can use the `grace_models` utility to download and inspect pre-trained GRACE
   to also fetch its LAMMPS-Kokkos export (`kokkos.npz`) into the model directory.
 - Run `grace_models checkpoint <model_name>` to download only the checkpoint (used for
   fine-tuning).
+- Run `grace_models update <model_name>` (or `--all`) to re-download cached copies whose
+  upstream artifact has changed — upgrading the `tensorpotential` package alone never
+  refreshes a model that is already in the cache. See
+  [Updating cached models](../utilities/#updating-cached-models).
 
 These models can be used for simulations within [ASE](../quickstart/#usage-in-ase) and [LAMMPS](../quickstart/#usage-in-lammps).  
 

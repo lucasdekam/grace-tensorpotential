@@ -78,20 +78,21 @@ df2extxyz train.pkl.gz -o train.extxyz
 ___
 
 ## `grace_models`
-Utility to list, inspect and download foundation models
+Utility to list, inspect, download and update foundation models
 
 ```
-usage: grace_models [-h] {list,info,download,checkpoint} ...
+usage: grace_models [-h] {list,info,download,checkpoint,update} ...
 
 Download foundation GRACE models
 
 positional arguments:
-  {list,info,download,checkpoint}
+  {list,info,download,checkpoint,update}
                         Sub-command help
     list                List available models
     info                Show declared + downloaded-artifact capability flags for a model
     download            Download a model
     checkpoint          Download a checkpoint
+    update              Re-download cached models/checkpoints whose origin URL is out of date
 
 options:
   -h, --help            show this help message and exit
@@ -104,6 +105,7 @@ options:
 | `info <model>` | Declared capability flags (precision, UQ, parallel) for one model, plus introspection of the artifact if it is already downloaded. |
 | `download <model>` | Download a model (`all` downloads every model). `--kokkos` also fetches its LAMMPS-Kokkos export (`kokkos.npz`) into the model directory. |
 | `checkpoint <model>` | Download only the checkpoint (needed for fine-tuning). |
+| `update [<model> ...]` | Re-download cached payloads whose upstream artifact has changed. `--all` checks every built-in model, `--dry-run` reports without downloading, `--force` re-downloads even when the cached copy is current. See [Updating cached models](#updating-cached-models). |
 
 Example:
 ```bash
@@ -112,6 +114,37 @@ grace_models list
 
 See [foundation models](../foundation/#downloading-foundation-models) for the
 model tables and the cache location.
+
+### Updating cached models
+
+The cache is keyed by model name, so upgrading `tensorpotential` on its own never
+refreshes an already-downloaded payload. When a model is re-exported upstream —
+as in 0.6.1, where the UQ-enabled models were rebuilt to fix a NaN in
+`virial_sigma` — `grace_models update` is what brings the local copy in line:
+
+```bash
+grace_models update GRACE-2L-OAM        # a single model
+grace_models update --all --dry-run     # report what is stale, download nothing
+grace_models update --all               # refresh everything that is stale
+```
+
+Every cached model and checkpoint directory carries a `.grace_origin.json`
+sidecar recording the URL it was fetched from. `update` compares that against the
+URL the installed package would use and re-downloads only the mismatches; a
+directory with no sidecar counts as outdated. The old copy is moved aside to
+`<path>.pre-update` and deleted only once the new download succeeds, so a failed
+transfer leaves the previous model in place.
+
+!!! warning "Directories you curate are never replaced"
+    `update` refuses to touch a cache entry that is a symlink, or one whose path
+    comes from an explicit `path:` / `checkpoint_path:` override in
+    [`models_registry.yaml`](../foundation/#user-defined-models). It reports what
+    it would have done and moves on — update that store yourself.
+
+`kokkos.npz` is distributed separately and is not part of the refreshed payload,
+so re-fetch it with `grace_models download <model> --kokkos` after an update if
+you use the [Kokkos pair styles](#export-to-npz-for-lammps-kokkos-pair-style).
+`update` reminds you whenever it replaces a directory that had one.
 ___
 
 ## `grace_utils`
@@ -329,6 +362,38 @@ options:
   -o OUTPUT, --output OUTPUT
                         path to the OUTPUT dataset (pkl.gzip) containing energy_predicted and forces_predicted
 ```
+
+### Python API: `predict_structures`
+
+`grace_predict` is a thin wrapper around `predict_structures`, which evaluates any
+ASE calculator over a list of structures. It is the same code path that
+[`grace_uq predict`](../uq/#cli-tool-grace_uq) uses, so it is also the way to get
+per-atom `gamma` for a whole dataset from Python:
+
+```python
+from tensorpotential.calculator import TPCalculator, predict_structures
+
+calc = TPCalculator(model="GRACE-2L-OAM")
+out = predict_structures(structures, calc)
+out["energy"]   # list, one entry per structure, aligned with `structures`
+out["forces"]
+
+# UQ-enabled model: harvest gamma alongside the energy
+out = predict_structures(structures, calc, properties=("energy",), extra=("gamma",))
+```
+
+Structures are copied, so your own objects never get a calculator attached. A
+property the calculator cannot provide (`stress`, for instance) comes back as
+`None` for that structure instead of raising.
+
+| Argument | Purpose |
+| :--- | :--- |
+| `properties` | Which of `energy`, `forces`, `stress` to compute. Default `("energy", "forces")`. |
+| `extra` | Keys read out of `calc.results` after each evaluation — e.g. `gamma`, `atomic_sigma`, `features` for a UQ-enabled model. A key the model does not provide yields `None`. |
+| `optional` | Properties the calculator may legitimately not implement, giving `None` rather than an error. Default `("stress",)`. |
+| `sort_by_natoms` | Evaluate largest-first so the biggest XLA shape compiles once. Default `True`; results are returned in input order either way. |
+| `on_error` | `"raise"` (default), or `"warn"` to log the failure and store `None` for that structure. |
+| `progress` | `callable(done, total)`, called after each structure — for a progress bar or log line. |
 
 ## `grace_preprocess`
 
