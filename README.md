@@ -1,6 +1,12 @@
 ## What's new
 
 
+### 03 September 2026: [0.6.1 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.1)
+
+- **Foundation models re-exported.** The distributed models were rebuilt to fix a NaN in `virial_sigma` (the uncertainty contribution to the virial). Cached models now record where they were downloaded from, and the new `grace_models update` re-downloads only the copies that are out of date.
+- **Tunable uncertainty threshold.** `grace_uq build --threshold-percentile Q` puts `gamma = 1` at the Q-th percentile of the training distribution instead of the default robust outlier fence — for training sets where a large fraction of atoms reads `gamma > 1`. The artifact records which calibration was used, and `grace_uq info` reports it.
+- **Bulk prediction.** A new `predict_structures` helper evaluates a whole list of structures with a single calculator instance; `grace_predict` and `grace_uq predict` now both use it.
+
 ### 07 July 2026: [0.6.0 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.0)
 
 - **Uncertainty estimates.** Models can now report a per-atom uncertainty score (gamma) that flags when a prediction is an extrapolation — useful for spotting unreliable regions and for active learning. Comes with a new `grace_uq` command line tool.
