@@ -67,16 +67,18 @@ class DFDQMetrics(AbstractMetrics):
         pred = predictions[cc.PREDICT_DF_DQ][:n_real]
         err = true - pred
 
-        return {
-            "abs/dfdq/per_comp": tf.reduce_sum(tf.math.abs(err)),
-            "sqr/dfdq/per_comp": tf.reduce_sum(err**2),
-        }
+        # RMSE only. Each metric costs two numbers on every log line, and the
+        # MAE of a derivative target adds little next to its RMSE -- `wf` keeps
+        # both so the logs of runs that predate these stay comparable.
+        return {"sqr/dfdq/per_struct": tf.reduce_sum(err**2)}
 
     @property
     def normalization_spec(self) -> dict[str, dict]:
         return {
-            "abs/dfdq/per_comp": {"norm": "n_atoms", "factor": 3.0},
-            "sqr/dfdq/per_comp": {"norm": "n_atoms", "factor": 3.0},
+            # `/per_struct` despite normalising by n_atoms, exactly as
+            # ForceMetrics does: cli/metrics.py sums only keys with that
+            # suffix, so anything else is dropped without a word.
+            "sqr/dfdq/per_struct": {"norm": "n_atoms", "factor": 3.0},
         }
 
 
@@ -96,14 +98,10 @@ class D2Edq2Metrics(AbstractMetrics):
         pred = predictions[cc.PREDICT_D2E_DQ2][:n_real]
         err = true - pred
 
-        return {
-            "abs/d2edq2/per_struct": tf.reduce_sum(tf.math.abs(err)),
-            "sqr/d2edq2/per_struct": tf.reduce_sum(err**2),
-        }
+        return {"sqr/d2edq2/per_struct": tf.reduce_sum(err**2)}
 
     @property
     def normalization_spec(self) -> dict[str, dict]:
         return {
-            "abs/d2edq2/per_struct": {"norm": "n_structures", "factor": 1.0},
             "sqr/d2edq2/per_struct": {"norm": "n_structures", "factor": 1.0},
         }

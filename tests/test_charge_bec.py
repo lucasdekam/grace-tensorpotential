@@ -288,3 +288,25 @@ def test_the_losses_are_reachable_the_way_gracemaker_resolves_them():
         component = cls(loss_component_weight=1.0)
         # the metrics come along with the loss, not from a second registry
         assert component.corresponding_metrics is not None, name
+
+
+def test_every_metric_key_carries_the_suffix_the_aggregator_looks_for():
+    """cli/metrics.py's aggregate_metrics sums only keys ending in
+    `/per_struct` and drops everything else silently, so a metric named
+    otherwise simply never appears in the log -- which is how `dfdq` went
+    missing from a run that was otherwise training on it correctly."""
+    from tensorpotential.extra.charge.metrics import (
+        D2Edq2Metrics,
+        DFDQMetrics,
+        WorkFunctionMetrics,
+    )
+
+    for cls in (WorkFunctionMetrics, DFDQMetrics, D2Edq2Metrics):
+        keys = cls().normalization_spec.keys()
+        assert keys, cls.__name__
+        for k in keys:
+            assert k.endswith("/per_struct"), f"{cls.__name__}: {k}"
+
+    # the two new ones report RMSE only, to keep the log line readable
+    for cls in (DFDQMetrics, D2Edq2Metrics):
+        assert all(k.startswith("sqr/") for k in cls().normalization_spec)
