@@ -175,3 +175,85 @@ def test_missing_bec_label_is_an_error_not_a_zero():
     builder = TotalChargeDataBuilder(fit_df_dq=True)
     with pytest.raises(KeyError, match=cc.ARRAYS_BEC_Z):
         builder.extract_from_ase_atoms(at)
+
+
+# -- the training path ------------------------------------------------------
+#
+# The tests above drive `ComputeStructureEnergyForcesVirialCharge`, which is
+# what the ASE calculator and the export use. Training goes through
+# `ComputeBatchEnergyForcesCharge` instead, with different plumbing: real
+# batches, padded atoms and structures, and the segment maps. These pin that
+# path against the single-structure one.
+
+
+def test_batched_dfdq_matches_the_single_structure_path():
+    """Same weights, same structure, two compute functions -- one batched and
+    padded, one not. Padding is where a per-atom label goes wrong quietly."""
+    from tensorpotential.data.databuilder import (
+        construct_batches,
+        GeometricalDataBuilder,
+    )
+    from tensorpotential.extra.charge.model import ComputeBatchEnergyForcesCharge
+
+    at = _atoms()
+    rng = np.random.default_rng(0)
+    at.arrays[cc.ARRAYS_BEC_Z] = rng.normal(size=(len(at), 3))
+    at.info[cc.INFO_TOTAL_CHARGE] = 0.4
+
+    instr = _instructions("GRACE_1LAYER_FILM")
+    batch_model = TPModel(
+        instr, compute_function=ComputeBatchEnergyForcesCharge(predict_bec=True)
+    )
+    batch_model.build(tf.float64)
+    tf.random.set_seed(20260918)
+    for v in batch_model.variables:
+        if "gate" in v.name:
+            v.assign(tf.random.normal(v.shape, stddev=0.5, dtype=v.dtype, seed=3))
+
+    single = TPModel(
+        instr,
+        compute_function=ComputeStructureEnergyForcesVirialCharge(predict_bec=True),
+    )
+    single.build(tf.float64)
+    for a, b in zip(batch_model.variables, single.variables):
+        b.assign(a)
+
+    batches, _ = construct_batches(
+        [at, at],
+        data_builders=[
+            GeometricalDataBuilder(ELEMENT_MAP, cutoff=5.0),
+            TotalChargeDataBuilder(fit_df_dq=True, fit_d2e_dq2=False,
+                                   normalize_weights=False),
+        ],
+        batch_size=2,
+        max_n_buckets=1,
+        return_padding_stats=True,
+        verbose=False,
+    )
+    # construct_batches hands back numpy; the tapes need tensors to watch
+    batch = {
+        k: (v if isinstance(v, tf.Tensor) else tf.constant(v))
+        for k, v in batches[0].items()
+    }
+    out = batch_model.compute(batch)
+
+    n_real = int(np.asarray(batches[0][constants.N_ATOMS_BATCH_REAL]))
+    got = np.asarray(out[cc.PREDICT_DF_DQ])[:n_real]
+    ref = _run(TPCalculator(model=single), at, 0.4)[3]
+
+    # two identical structures in the batch, so both halves equal the single
+    assert n_real == 2 * len(at)
+    np.testing.assert_allclose(got[: len(at)], ref, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(got[len(at):], ref, rtol=1e-8, atol=1e-10)
+
+    # the label survives batching with its components intact, and the padded
+    # atoms carry no weight
+    label = np.asarray(batches[0][cc.DATA_REFERENCE_DF_DQ])
+    weight = np.asarray(batches[0][cc.DATA_DF_DQ_WEIGHTS])
+    cell = np.asarray(at.get_cell())
+    area = np.linalg.norm(np.cross(cell[0], cell[1]))
+    expected = at.arrays[cc.ARRAYS_BEC_Z] / (area * cc.EPSILON_0)
+    np.testing.assert_allclose(label[: len(at)], expected, rtol=1e-12)
+    assert label.shape[0] == weight.shape[0] >= n_real
+    assert np.all(weight[n_real:] == 0.0), "padded atoms must carry zero weight"
+    assert np.all(weight[:n_real] == 1.0)
