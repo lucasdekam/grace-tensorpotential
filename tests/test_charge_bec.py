@@ -274,3 +274,17 @@ def test_predict_bec_can_be_switched_on_from_input_yaml():
     assert ComputeStructureEnergyForcesVirialCharge(
         compute_function_config={"predict_bec": True}
     ).predict_bec
+
+
+def test_the_losses_are_reachable_the_way_gracemaker_resolves_them():
+    """`fit.loss.extra_components` names a class and cli/prepare.py getattrs it
+    off `tensorpotential.extra.extra_losses`. A loss that exists but is not
+    re-exported there is invisible to a fit -- and fails only once the job is
+    already queued and running."""
+    from tensorpotential.extra import extra_losses
+
+    for name in ("WeightedWorkFunctionLoss", "WeightedDFDQLoss", "WeightedD2Edq2Loss"):
+        cls = getattr(extra_losses, name)
+        component = cls(loss_component_weight=1.0)
+        # the metrics come along with the loss, not from a second registry
+        assert component.corresponding_metrics is not None, name
