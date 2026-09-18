@@ -1,6 +1,12 @@
 ## What's new
 
 
+### 03 September 2026: [0.6.1 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.1)
+
+- **Foundation models re-exported.** The distributed models were rebuilt to fix a NaN in `virial_sigma` (the uncertainty contribution to the virial). Cached models now record where they were downloaded from, and the new `grace_models update` re-downloads only the copies that are out of date.
+- **Tunable uncertainty threshold.** `grace_uq build --threshold-percentile Q` puts `gamma = 1` at the Q-th percentile of the training distribution instead of the default robust outlier fence — for training sets where a large fraction of atoms reads `gamma > 1`. The artifact records which calibration was used, and `grace_uq info` reports it.
+- **Bulk prediction.** A new `predict_structures` helper evaluates a whole list of structures with a single calculator instance; `grace_predict` and `grace_uq predict` now both use it.
+
 ### 07 July 2026: [0.6.0 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.0)
 
 - **Uncertainty estimates.** Models can now report a per-atom uncertainty score (gamma) that flags when a prediction is an extrapolation — useful for spotting unreliable regions and for active learning. Comes with a new `grace_uq` command line tool.
@@ -16,7 +22,7 @@ If a model was fitted with `gracemaker` version < 0.5.1, it will not be compatib
 You can convert it to the new format using the following command:  
 
 ```bash
-grace_utils -p seed/1/model.yaml -c seed/1/checkpoint/checkpoint.best_test_loss.index update_model
+grace_utils -p seed/1/model.yaml -c seed/1/checkpoints/checkpoint.best_test_loss.index update_model
 ```  
 
 This will generate new files with the "-converted" suffix, which you can replace the old files (`model.yaml` and checkpoints) with.
@@ -42,14 +48,19 @@ https://acesupport.zulipchat.com/join/xtwxu2grjbtg64m3vnhypi6p/
 
 # Reference
 Please see 
-* [Y.Lysogorskiy, A. Bochkarev, R.Drautz, Graph atomic cluster expansion for foundational machine learning interatomic potentials, arXiv:2508.17936](https://arxiv.org/abs/2508.17936)
+* [Y.Lysogorskiy, A. Bochkarev, R.Drautz, Graph atomic cluster expansion for foundational machine learning interatomic potentials. npj Computational Materials 12(1), 114 (2026)](https://www.nature.com/articles/s41524-026-01979-1)
 
 ```bibtex
-@article{lysogorskiy2025graph,
+@article{lysogorskiy2026graph,
   title={Graph atomic cluster expansion for foundational machine learning interatomic potentials},
   author={Lysogorskiy, Yury and Bochkarev, Anton and Drautz, Ralf},
-  journal={arXiv preprint arXiv:2508.17936},
-  year={2025}
+  journal={npj Computational Materials},
+  volume={12},
+  number={1},
+  pages={114},
+  year={2026},
+  doi={10.1038/s41524-026-01979-1},
+  url={https://www.nature.com/articles/s41524-026-01979-1}
 }
 ```
 

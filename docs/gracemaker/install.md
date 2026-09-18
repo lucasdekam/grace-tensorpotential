@@ -4,7 +4,7 @@ To use GRACE models, including fitting and utilizing pre-fitted models, you need
 
 ### Setting Up the Environment
 
-#### Micromamba (Recommended)
+#### Micromamba (recommended)
 
 For [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), install it by running the following command:
 
@@ -18,6 +18,9 @@ Then, create a new environment:
 micromamba create -n grace python=3.11 
 micromamba activate grace
 ```
+
+`conda`/`mamba` or a plain `python -m venv` environment work as well — replace
+`micromamba` with your tool of choice in the commands below.
 
 ---
 
@@ -40,7 +43,7 @@ pip install .
 TensorFlow should be installed automatically. However, to manually install TensorFlow with GPU support:
 
 ```bash
-pip install tensorflow[and-cuda]<2.20
+pip install "tensorflow[and-cuda]<=2.20"
 ```
 #### TensorFlow & Keras Notes
 
@@ -71,9 +74,9 @@ Learn more [here](../foundation/#pretrained-grace-foundation-models).
 
 This is a standalone C++ implementation of the GRACE/FS model that can be executed on a CPU without the TensorFlow library and parallelized using standard MPI.
 
-* Activate the conda environment:
+* Activate the environment:
 ```bash
-conda activate grace
+micromamba activate grace   # or: conda activate grace
 ```
 
 * Clone the repository:
@@ -98,9 +101,9 @@ Once installed, you can use the `pace_activeset` utility to [generate](../quicks
 
 ## LAMMPS with GRACE
 
-* Activate the conda environment (it should contain TensorFlow):
+* Activate the environment (it should contain TensorFlow):
 ```bash
-conda activate grace
+micromamba activate grace   # or: conda activate grace
 ```
 
 * Clone the LAMMPS repository:
@@ -135,8 +138,8 @@ cmake -DCMAKE_BUILD_TYPE=Release -D BUILD_MPI=ON -DPKG_ML-PACE=ON -DNO_GRACE_TF=
 ```
 
 #### KOKKOS build
-KOKKOS support is available for `grace/fs`, `grace/1l/kk`, and `grace/2l/kk`.
-The `grace/1l/kk` and `grace/2l/kk` pair styles read a `.npz` weights file
+KOKKOS support is available for `grace/fs`, `grace/1l/kk`, `grace/2l/kk` and `grace/3l/kk`.
+The `grace/{1l,2l,3l}/kk` pair styles read a `.npz` weights file
 produced by `grace_utils export_kokkos` (see
 [utilities](../utilities/#export-to-npz-for-lammps-kokkos-pair-style))
 and do not require TensorFlow at runtime.
@@ -146,6 +149,16 @@ Use following cmake configuration:
 cmake ../cmake -DBUILD_MPI=ON -DCMAKE_BUILD_TYPE=Release -DPKG_MC=ON -DPKG_ML-PACE=ON -DPKG_KOKKOS=ON -DKokkos_ENABLE_CUDA=ON -DKokkos_ENABLE_OPENMP=ON -DKokkos_ARCH_NATIVE=ON
 ```
 or `-DKokkos_ARCH_HOPPER90=ON` for H100/200 or `-DKokkos_ARCH_AMPERE80=ON` for A100.
+
+!!! warning "Use CUDA >= 12.8 for the KOKKOS build"
+    With CUDA 12.2-12.6 the build can hang for many hours (without any error
+    message) while compiling `pair_grace_2l_kokkos.cpp` and
+    `pair_grace_2l_cpu_kokkos.cpp`. This is an `nvcc` bug that is fixed in
+    CUDA 12.8; lowering the optimization level with `-Xptxas` does not help.
+    See the FAQ entry
+    [LAMMPS KOKKOS build hangs for hours on `pair_grace_2l` files](../faq/#lammps-kokkos-build-hangs-for-hours-on-pair_grace_2l-files)
+    for the diagnosis and for how to get a newer `nvcc` without touching your
+    system modules.
 
 Note, that for running LAMMPS with KOKKOS acceleration:
 ```bash

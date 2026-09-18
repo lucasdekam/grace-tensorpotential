@@ -355,6 +355,113 @@ def info_model(args):
         print("All available parts are downloaded.")
 
 
+def update_models(args):
+    """Re-download cached payloads whose origin URL no longer matches this package.
+
+    The cache is keyed by model name, so a package upgrade alone never refreshes a
+    payload (see ``foundation_models.check_origin``). This walks the cached model and
+    checkpoint dirs, compares each ``.grace_origin.json`` against the URL the installed
+    package would use, and re-downloads the ones that differ.
+
+    Refuses to touch a symlinked cache entry: on a developer box
+    ``~/.cache/grace/<m>`` often points into a curated model store, and deleting
+    through the link would destroy the original.
+    """
+    import shutil
+
+    from tensorpotential.calculator.foundation_models import (
+        FOUNDATION_CACHE_DIR,
+        FOUNDATION_CHECKPOINTS_CACHE_DIR,
+        MODELS_ALIASES_DICT,
+        MODELS_METADATA,
+        CORE_MODELS_NAME_LIST,
+        MODEL_URL_KEY,
+        CHECKPOINT_URL_KEY,
+        MODEL_PATH_KEY,
+        CHECKPOINT_PATH_KEY,
+        read_origin_sidecar,
+        _tag_from_url,
+        get_or_download_model,
+        get_or_download_checkpoint,
+    )
+
+    if args.all:
+        names = list(CORE_MODELS_NAME_LIST)
+    elif args.model_name:
+        names = [MODELS_ALIASES_DICT.get(n, n) for n in args.model_name]
+    else:
+        print("Nothing to do: give one or more model names, or --all.")
+        return
+
+    n_ok = n_upd = n_skip = n_fail = 0
+    for name in names:
+        meta = MODELS_METADATA.get(name)
+        if meta is None:
+            print(f"  {name}: not a known model - skipped")
+            n_skip += 1
+            continue
+        for payload, url_key, path_key, root, fetch in (
+            ("model", MODEL_URL_KEY, MODEL_PATH_KEY,
+             FOUNDATION_CACHE_DIR, get_or_download_model),
+            ("checkpoint", CHECKPOINT_URL_KEY, CHECKPOINT_PATH_KEY,
+             FOUNDATION_CHECKPOINTS_CACHE_DIR, get_or_download_checkpoint),
+        ):
+            url = meta.get(url_key)
+            override = meta.get(path_key)
+            path = override or os.path.join(root, name)
+            if url is None or not os.path.isdir(path):
+                continue  # nothing to compare, or simply not cached
+            rec = read_origin_sidecar(path)
+            if rec is not None and rec.get("url") == url and not args.force:
+                n_ok += 1
+                continue
+            was = (rec or {}).get("tag") or ("no provenance record" if rec is None else "?")
+            print(f"  {name} [{payload}]: {was} -> {_tag_from_url(url) or url}")
+
+            # Never delete a directory this package did not create. Two spellings of
+            # "the user curates this": an explicit path override in the metadata, and
+            # a cache entry symlinked into a local model store.
+            if override:
+                print(f"      REFUSING: {path} is an explicit local path for this entry")
+                print("      Update that directory yourself; nothing here may replace it.")
+                n_skip += 1
+                continue
+            if os.path.islink(path):
+                print(f"      REFUSING: {path} is a symlink -> {os.path.realpath(path)}")
+                print("      Update the store it points at, or remove the symlink first.")
+                n_skip += 1
+                continue
+            if args.dry_run:
+                n_upd += 1
+                continue
+
+            # Download first, swap second. rmtree-then-fetch loses the payload for
+            # good if the download fails (network blip, missing archive), and takes
+            # the rest of an --all run down with it.
+            had_kokkos = os.path.isfile(os.path.join(path, "kokkos.npz"))
+            stash = f"{path}.pre-update"
+            if os.path.exists(stash):
+                shutil.rmtree(stash)
+            os.rename(path, stash)  # same filesystem -> atomic
+            try:
+                fetch(name)
+            except BaseException as exc:  # noqa: BLE001 - restore, report, keep going
+                shutil.rmtree(path, ignore_errors=True)
+                os.rename(stash, path)
+                print(f"      FAILED ({type(exc).__name__}: {exc}); previous copy restored")
+                n_fail += 1
+                continue
+            shutil.rmtree(stash)
+            n_upd += 1
+            if had_kokkos and payload == "model":
+                print(f"      note: kokkos.npz was replaced; re-fetch with "
+                      f"`grace_models download {name} --kokkos` if you use LAMMPS")
+
+    verb = "would update" if args.dry_run else "updated"
+    tail = f"   failed: {n_fail}" if n_fail else ""
+    print(f"\nup-to-date: {n_ok}   {verb}: {n_upd}   skipped: {n_skip}{tail}")
+
+
 def download_model(args):
     """Download the specified model using the get_or_download_model function.
 
@@ -460,6 +567,27 @@ def build_parser():
         "model_name", type=str, help="Name of the model to download checkpoint for"
     )
     parser_checkpoint.set_defaults(func=download_checkpoint)
+
+    # Sub-command: update
+    parser_update = subparsers.add_parser(
+        "update",
+        help="Re-download cached models/checkpoints whose origin URL is out of date",
+    )
+    parser_update.add_argument(
+        "model_name", type=str, nargs="*", help="Model name(s) to update"
+    )
+    parser_update.add_argument(
+        "--all", action="store_true", help="check every built-in model"
+    )
+    parser_update.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download even when the origin URL already matches",
+    )
+    parser_update.add_argument(
+        "--dry-run", action="store_true", help="report what would change, download nothing"
+    )
+    parser_update.set_defaults(func=update_models)
 
     return parser
 

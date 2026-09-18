@@ -7,18 +7,15 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from tensorpotential.calculator import TPCalculator
+from tensorpotential.calculator import TPCalculator, predict_structures
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-tqdm.pandas()
 
 LOG_FMT = "%(asctime)s %(levelname).1s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt="%Y/%m/%d %H:%M:%S")
 logger = logging.getLogger()
-
-NUMBER_ASSERT_ERRORS_SHOWN = 3
 
 
 def set_magmom(at, magmoms):
@@ -35,25 +32,21 @@ def set_magmom(at, magmoms):
     return at
 
 
-def predict(row, calc, raise_errors):
-    at = row["ase_atoms"].copy()
-    if "mag_mom" in row:
-        at = set_magmom(at, row["mag_mom"])
-    at.calc = calc
-    try:
-        e = at.get_potential_energy()
-        f = at.get_forces()
-        s = at.get_stress()
-        return {"energy": e, "forces": f, "stress": s}
-    except AssertionError as e:
-        if raise_errors:
-            raise e
-        global NUMBER_ASSERT_ERRORS_SHOWN
-        if NUMBER_ASSERT_ERRORS_SHOWN > 0:
-            print("Error: ", e)
-            NUMBER_ASSERT_ERRORS_SHOWN -= 1
-            print("No more errors will be shown.")
-        return {}
+def _atoms_with_magmoms(df):
+    """The structures to evaluate, with initial magnetic moments applied.
+
+    `predict_structures` copies each structure before attaching a calculator, so
+    the dataframe's own objects can be handed over as-is. Only the magmom branch
+    needs a copy of its own, because `set_magmom` writes into `atoms.arrays` —
+    copying the whole column up front would pin a second copy of the dataset for
+    the entire run.
+    """
+    if "mag_mom" not in df.columns:
+        return df["ase_atoms"].tolist()
+    return [
+        at if mm is None else set_magmom(at.copy(), mm)
+        for at, mm in zip(df["ase_atoms"], df["mag_mom"])
+    ]
 
 
 def main(args=None):
@@ -115,15 +108,22 @@ def main(args=None):
 
     logger.info("Starting prediction")
 
-    df["prediction"] = df.progress_apply(predict, axis=1, args=(calc, raise_errors))
-    df["energy_predicted"] = df["prediction"].map(lambda x: x.get("energy"))
-    df["forces_predicted"] = df["prediction"].map(lambda x: x.get("forces"))
-    df["stress_predicted"] = df["prediction"].map(lambda x: x.get("stress"))
+    # predict_structures evaluates largest-first (one XLA compile for the widest
+    # shape) and returns results in the dataframe's own order.
+    with tqdm(total=len(df)) as bar:
+        pred = predict_structures(
+            _atoms_with_magmoms(df),
+            calc,
+            properties=("energy", "forces", "stress"),
+            on_error="raise" if raise_errors else "warn",
+            progress=lambda done, total: bar.update(),
+        )
+    df["energy_predicted"] = pred["energy"]
+    df["forces_predicted"] = pred["forces"]
+    df["stress_predicted"] = pred["stress"]
 
     logger.info(f"Saving dataset to {output_file}")
-    df.drop(columns=["ase_atoms", "prediction"]).to_pickle(
-        output_file, compression="gzip"
-    )
+    df.drop(columns=["ase_atoms"]).to_pickle(output_file, compression="gzip")
 
 
 if __name__ == "__main__":

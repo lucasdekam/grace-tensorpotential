@@ -8,6 +8,12 @@ software geared towards support for multi-component materials and graph architec
 ## What's new
 
 
+### 03 September 2026: [0.6.1 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.1)
+
+- **[Foundation models re-exported](https://gracemaker.readthedocs.io/en/latest/gracemaker/utilities/#updating-cached-models).** The distributed models were rebuilt to fix a NaN in `virial_sigma` (the uncertainty contribution to the virial). Cached models now record where they were downloaded from, and the new `grace_models update` re-downloads only the copies that are out of date.
+- **[Tunable uncertainty threshold](https://gracemaker.readthedocs.io/en/latest/gracemaker/uq/#calibrating-the-threshold).** `grace_uq build --threshold-percentile Q` puts `gamma = 1` at the Q-th percentile of the training distribution instead of the default robust outlier fence — for training sets where a large fraction of atoms reads `gamma > 1`. The artifact records which calibration was used, and `grace_uq info` reports it.
+- **[Bulk prediction](https://gracemaker.readthedocs.io/en/latest/gracemaker/utilities/#python-api-predict_structures).** A new `predict_structures` helper evaluates a whole list of structures with a single calculator instance; `grace_predict` and `grace_uq predict` now both use it.
+
 ### 07 July 2026: [0.6.0 Release](https://github.com/ICAMS/grace-tensorpotential/releases/tag/0.6.0)
 
 - **[Uncertainty estimates](https://gracemaker.readthedocs.io/en/latest/gracemaker/uq/).** Models can now report a per-atom uncertainty score (gamma) that flags when a prediction is an extrapolation — useful for spotting unreliable regions and for active learning. Comes with a new `grace_uq` command line tool.
@@ -38,7 +44,12 @@ software geared towards support for multi-component materials and graph architec
   
     * **GRACE-2L**: Semi-local, non-linear model offering state-of-the-art accuracy. 
     Utilizes TensorFlow library to run simulations in LAMMPS or in python.
-    Best applied for simulating molecular systems and materials with up to tens of thousand of atoms.
+    Best applied for simulating molecular systems and materials with up to tens of thousands of atoms.
+
+    * **GRACE-3L**: Semi-local, non-linear model with a third message-passing layer for a larger
+    effective receptive field, offering the best accuracy of the series. Available as
+    [foundation models](gracemaker/foundation/#three-layer-3l-models) (natively fp32) for use in
+    python or in LAMMPS, including the TensorFlow-free `grace/3l/kk` Kokkos pair style.
 
 ## What's next ?
 * !!NEW!! [Video tutorial](https://www.youtube.com/watch?v=rndnkiu9LGE)
@@ -58,8 +69,9 @@ This code and the foundation models are distributed under the [Academic Software
 
 ## Citation
 
-Please cite following papers if you use GRACEmkaer in your work:
+Please cite the following papers if you use GRACEmaker in your work:
 
+- [Lysogorskiy, Y., Bochkarev, A. and Drautz, R. Graph atomic cluster expansion for foundational machine learning interatomic potentials. npj Computational Materials 12(1), 114 (2026)](https://www.nature.com/articles/s41524-026-01979-1)
 - [Bochkarev, A., Lysogorskiy, Y. and Drautz, R. Graph Atomic Cluster Expansion for Semilocal Interactions beyond Equivariant Message Passing. Phys. Rev. X 14, 021036 (2024)](https://journals.aps.org/prx/abstract/10.1103/PhysRevX.14.021036)
 
 

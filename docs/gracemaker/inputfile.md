@@ -39,7 +39,7 @@ data:
   #                                # per-axis dict also supported: {atom: 0.1, bond: 0.05, structure: 5}
   #   outlier_strategy: expand     # "expand" (grow bucket), "warn_skip" (drop), or "error" (raise)
   #   verbose: false               # log bucket discovery events
-  #   prefetch_queue_size: 0       # set to >0 to thread prefetcing
+  #   prefetch_queue_size: 0       # set to >0 to thread prefetching
 
   ## Extra input/reference DataBuilder/s required for model
   # extra_components: {
@@ -54,7 +54,7 @@ potential:
 
 
   ## Option 1. Presets
-  preset: GRACE_1LAYER # FS, GRACE_1LAYER, GRACE_2LAYER
+  preset: GRACE_1LAYER_latest # FS, GRACE_1LAYER_latest, GRACE_2LAYER_latest
   # kwargs: {n_rad_max: 16}  # kw-arguments that will be passed to preset or custom model
 
   ## Option 2. Custom model in python file (advanced)
@@ -165,7 +165,7 @@ fit:
   ## To use jit_compile efficiently, data must be padded.
   ## Bucket is a group of batches padded to the same shape for efficient JIT execution.
   ## max_n_buckets can be an integer or "auto".
-  ## In "auto" mode, the number of buckets is estimated as ~sqrt(num_batches), clamped to [1, 32].
+  ## In "auto" mode, the bucket count is chosen automatically (see `auto_bucket_max_padding` below).
   ## `train_max_n_buckets`: "auto" (default) or integer. Max number of distinct buffer shapes (buckets) for training.
   ##   - "auto": dynamically determines the minimum number of buckets (1-32) that keeps padding overhead below `auto_bucket_max_padding`.
   ## `test_max_n_buckets`: "auto" (default) or integer. Same for test set.
@@ -218,14 +218,14 @@ fit:
   #  normalize_force_per_structure: True ## force-weights is divided by number of atoms
 ```
 
-This is complete list of parameters. For the most of practical purposes
-it is sufficient to generate input file with `gracemaker -t` utility.
+This is the complete list of parameters. For most practical purposes
+it is sufficient to generate the input file with the `gracemaker -t` utility.
 
-Detailed weighting option:
+Detailed weighting option (`weighting` belongs to the `fit` section):
 
 ```{ .yaml }
 
-potential:
+fit:
   weighting: {type: energy_based, 
     ## number of structures to randomly select from the initial dataset
     nfit: 10000,

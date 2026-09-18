@@ -110,6 +110,13 @@ def _print_header(artifact_path: str, meta: dict):
         print(" (raw + effective)")
     else:
         print()
+    # gamma is NOT comparable between estimators, so name the one that was used.
+    # Only meaningful when thresholds are actually present.
+    if meta["has_thresholds"]:
+        thr_mode = meta.get("threshold_mode", "robust_mad")
+        print(f"  threshold estimator : {thr_mode}", end="")
+        print(" (median + 3*1.4826*MAD)" if thr_mode == "robust_mad"
+              else " -- gamma=1 is a training percentile, NOT comparable with robust_mad")
     print(f"  histograms present  : {meta['has_histograms']}", end="")
     if meta.get("has_eff_histograms"):
         print(" (raw + effective)")

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import sys
 import tarfile
+from datetime import datetime, timezone
 
 import keyword
 from typing import Final
@@ -76,7 +80,16 @@ UQV6_MODEL_TAG: Final[str] = "model-v3-uq-v6"  # v3: 18 2L/1L SavedModel archive
 UQV6_CHECKPOINT_TAG: Final[str] = "checkpoint-v3-uq-v6"  # v3 checkpoint archives
 UQV6_KOKKOS_TAG: Final[str] = "kk-v3-uq-v6"  # v3 raw kokkos.npz files
 
+# v5 (uqv6): SavedModel payload re-exported to fix the NaN `virial_sigma` (all 38
+# variants, 1L/2L/3L alike, so this ONE tag supersedes both model-v3-uq-v6 and
+# model-v4-uq-v6). Checkpoints and kokkos.npz are byte-identical and keep their v3/v4
+# tags, so a 3L entry legitimately reads model=v5, checkpoint=v4, kk=v4.
+# See deployment_changelog.md "v5 — uq-v6".
+UQV6_V5_MODEL_TAG: Final[str] = "model-v5-uq-v6"
+
 # v4 (uqv6): the first 3L foundation models (fp32-only). Separate immutable tags.
+# NOTE: UQV6_V4_MODEL_TAG is superseded by UQV6_V5_MODEL_TAG and is no longer used for
+# any URL; kept so the historical tag name stays discoverable from the code.
 UQV6_V4_MODEL_TAG: Final[str] = "model-v4-uq-v6"
 UQV6_V4_CHECKPOINT_TAG: Final[str] = "checkpoint-v4-uq-v6"
 UQV6_V4_KOKKOS_TAG: Final[str] = "kk-v4-uq-v6"
@@ -87,7 +100,7 @@ def _uqv6_entry(
     description: str,
     kokkos_base: str | None = None,
     *,
-    model_tag: str = UQV6_MODEL_TAG,
+    model_tag: str = UQV6_V5_MODEL_TAG,
     checkpoint_tag: str = UQV6_CHECKPOINT_TAG,
     kokkos_tag: str = UQV6_KOKKOS_TAG,
 ) -> dict:
@@ -96,8 +109,10 @@ def _uqv6_entry(
     Works for both the fp32 default (``name=<bare>``) and the fp64 variant
     (``name=<bare>-fp64``); only the archive filename differs by the suffix.
     ``kokkos_base`` is the precision-agnostic base name keying the shared
-    ``kokkos/<base>-kokkos.npz``. The ``*_tag`` args pin the release: they default
-    to the v3 (2L/1L) tags; the 3L release passes the v4 tag family.
+    ``kokkos/<base>-kokkos.npz``. The ``*_tag`` args pin the release: the SavedModel
+    defaults to the v5 tag (shared by every uqv6 model since the virial_sigma
+    re-export), while checkpoint/kokkos default to the v3 family and the 3L release
+    overrides those two with the v4 family.
     """
     entry = {
         MODEL_URL_KEY: f"{HF_REPO_BASE}/{model_tag}/models/{name}-model.tar.gz",
@@ -249,7 +264,7 @@ for _name in _UQV6_V4_MODEL_NAMES:
         _name,
         f"A 3-layer GRACE foundation model: {_name} (fp32).",
         kokkos_base=_name,
-        model_tag=UQV6_V4_MODEL_TAG,
+        # SavedModel rides the shared v5 tag; checkpoint + kokkos stay on v4.
         checkpoint_tag=UQV6_V4_CHECKPOINT_TAG,
         kokkos_tag=UQV6_V4_KOKKOS_TAG,
     )
@@ -399,6 +414,108 @@ def _stream_download(url, dest_path, desc=None):
     )
 
 
+def _tp_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("tensorpotential")
+    except Exception:
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar
+#
+# The cache is keyed by MODEL NAME only (`get_or_download_*` short-circuits on
+# `os.path.isdir`), so upgrading the package silently leaves an old payload in place.
+# Record the exact origin URL -- which contains the immutable release tag -- next to
+# the payload, and compare it at load. The comparison is a local string compare: no
+# network, offline-safe, and cheap enough to run on every load.
+# See pgs/uq/deployment_protocol.md §7.
+# ---------------------------------------------------------------------------
+ORIGIN_SIDECAR: Final[str] = ".grace_origin.json"
+NO_UPDATE_CHECK_ENV: Final[str] = "GRACE_NO_UPDATE_CHECK"
+# Anything else (including "0"/"false"/"no"/"off") leaves the check ON: a bare
+# truthiness test on the raw string would silently disable it for exactly the
+# spellings a user reaches for when they mean "please DO check".
+_TRUTHY: Final[frozenset] = frozenset({"1", "true", "yes", "on"})
+
+# One warning per (model, payload) per process: TPCalculator may be built in a loop.
+_ORIGIN_WARNED: set = set()
+
+
+def _tag_from_url(url: str) -> str | None:
+    """Pull the release tag out of a Hugging Face ``/resolve/<tag>/...`` URL."""
+    parts = url.split("/resolve/", 1)
+    return parts[1].split("/", 1)[0] if len(parts) == 2 else None
+
+
+def write_origin_sidecar(path: str, model: str, payload: str, url: str, **extra) -> None:
+    """Stamp ``<path>/.grace_origin.json`` with the URL the payload came from.
+
+    Best-effort: a read-only or full filesystem must never break a download.
+    """
+    record = {
+        "model_name": model,
+        "payload": payload,
+        "url": url,
+        "tag": _tag_from_url(url),
+        "downloaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tensorpotential_version": _tp_version(),
+    }
+    record.update({k: v for k, v in extra.items() if v is not None})
+    try:
+        with open(os.path.join(path, ORIGIN_SIDECAR), "w") as f:
+            json.dump(record, f, indent=2)
+    except OSError as e:
+        logging.debug(f"Could not write {ORIGIN_SIDECAR} in {path}: {e}")
+
+
+def read_origin_sidecar(path: str) -> dict | None:
+    try:
+        with open(os.path.join(path, ORIGIN_SIDECAR)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def check_origin(path: str, model: str, payload: str, expected_url: str | None) -> bool:
+    """Warn when a cached payload did not come from the URL this package expects.
+
+    Returns True when the payload is current. A missing sidecar counts as outdated:
+    every copy downloaded before this mechanism existed lacks one, and we cannot tell
+    a current copy from a stale one without re-downloading.
+
+    No-ops when ``expected_url`` is None -- there is nothing to compare. Callers
+    additionally skip the check for entries that declare an explicit local
+    ``path``/``checkpoint_path``: those point at a directory the user curates, which
+    this package neither downloaded nor may replace.
+    """
+    if expected_url is None or (
+        os.environ.get(NO_UPDATE_CHECK_ENV, "").strip().lower() in _TRUTHY
+    ):
+        return True
+    rec = read_origin_sidecar(path)
+    if rec is not None and rec.get("url") == expected_url:
+        return True
+    key = (model, payload)
+    if key in _ORIGIN_WARNED:
+        return False
+    _ORIGIN_WARNED.add(key)
+    cached_from = (
+        f"{rec.get('tag') or rec.get('url')}" if rec else "no provenance record"
+    )
+    print(
+        f"[tensorpotential] WARNING: cached GRACE {payload} '{model}' may be outdated.\n"
+        f"  cached from : {cached_from}\n"
+        f"  package uses: {_tag_from_url(expected_url) or expected_url}\n"
+        f"  update with : grace_models update {model}\n"
+        f"  suppress    : {NO_UPDATE_CHECK_ENV}=1",
+        file=sys.stderr,
+    )
+    return False
+
+
 def download_extract_rename(url, model_path):
     model_path = model_path[:-1] if model_path.endswith("/") else model_path
     # sciebo/Nextcloud public-share links require a trailing "/download";
@@ -441,14 +558,25 @@ def get_or_download_model(model):
             raise ValueError(f"No available URL to download for {model}")
         print("Downloading GRACE model")
         download_extract_rename(url, model_path)
+        write_origin_sidecar(
+            model_path, model, "model", url,
+            kokkos_url=model_metadata.get(KOKKOS_URL_KEY),
+        )
         print(f"GRACE model downloaded to {model_path}")
     else:
         print(f"Using cached GRACE model from {model_path}")
+        if not model_metadata.get(MODEL_PATH_KEY):
+            check_origin(model_path, model, "model", model_metadata.get(MODEL_URL_KEY))
     print(f"Model license: {model_metadata.get(LICENSE_KEY, 'not provided')}")
     return model_path
 
 
 def get_or_download_checkpoint(model):
+    # remap old names into new for backward compat -- same as get_or_download_model;
+    # without it an aliased name (e.g. from input.yaml::finetune_foundation_model)
+    # raises KeyError here.
+    model = MODELS_ALIASES_DICT.get(model) or model
+
     model_metadata = MODELS_METADATA[model]
     checkpoint_path = model_metadata.get(CHECKPOINT_PATH_KEY) or os.path.join(
         FOUNDATION_CHECKPOINTS_CACHE_DIR, model
@@ -460,9 +588,15 @@ def get_or_download_checkpoint(model):
             raise ValueError(f"No available checkpoint URL for {model}")
         print("Downloading GRACE checkpoint")
         download_extract_rename(url, checkpoint_path)
+        write_origin_sidecar(checkpoint_path, model, "checkpoint", url)
         print(f"GRACE model checkpoint downloaded to {checkpoint_path}")
     else:
         print(f"Using cached GRACE checkpoint from {checkpoint_path}")
+        if not model_metadata.get(CHECKPOINT_PATH_KEY):
+            check_origin(
+                checkpoint_path, model, "checkpoint",
+                model_metadata.get(CHECKPOINT_URL_KEY),
+            )
     print(f"Model license: {model_metadata.get(LICENSE_KEY, 'not provided')}")
     return checkpoint_path
 

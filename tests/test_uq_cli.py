@@ -24,6 +24,8 @@ from ase import Atoms
 from sklearn.cluster import KMeans
 
 from tensorpotential.scripts import grace_uq as dispatcher
+
+from .test_bulk_predict import RecordingCalc
 from tensorpotential.uq import constants as uq_constants
 from tensorpotential.uq.artifact_builder import GMMUQArtifactBuilder
 from tensorpotential.uq.cli import select as select_mod
@@ -263,6 +265,28 @@ def test_read_artifact_metadata(tmp_path):
     assert meta["element_map"] == ["Mo", "Nb"]
     assert meta["has_thresholds"] is True
     assert meta["has_histograms"] is False
+
+
+def test_legacy_artifact_without_threshold_mode_reads_as_robust(tmp_path):
+    """Artifacts written before --threshold-percentile carry no threshold_mode
+    key. They were all built with the robust estimator, so the loader must say
+    so rather than returning None and breaking `info`."""
+    path = str(tmp_path / "legacy.npz")
+    _write_synthetic_info_artifact(path)
+    with np.load(path) as data:
+        assert "threshold_mode" not in data.files, "fixture is not a legacy artifact"
+    assert read_artifact_metadata(path)["threshold_mode"] == "robust_mad"
+
+
+def test_info_reports_the_threshold_estimator(tmp_path, capsys):
+    """gamma is not comparable across estimators, so `info` must name the one
+    that produced the thresholds — including for legacy artifacts."""
+    path = str(tmp_path / "legacy.npz")
+    _write_synthetic_info_artifact(path)
+    assert info_main([path]) == 0
+    out = capsys.readouterr().out
+    assert "threshold estimator : robust_mad" in out
+    assert "median + 3*1.4826*MAD" in out
 
 
 def test_info_main_prints_summary(tmp_path, capsys):
@@ -1348,3 +1372,53 @@ def test_load_uq_model_tolerates_checkpoint_without_intra_epoch_save(monkeypatch
     assert tp is not None
     # The basis-RP UQ feature was patched in under the canonical FEATURES key.
     assert uq_constants.FEATURES in instructions
+
+
+# ===========================================================================
+# predict worker: the *_predicted schema on top of predict_structures
+# ===========================================================================
+
+
+def test_predict_columns_emits_the_predicted_schema_in_input_order():
+    from tensorpotential.uq.cli.predict import _predict_columns
+
+    atoms = [_make_atoms("H", n=n) for n in (1, 4, 2)]
+    cols = _predict_columns(atoms, RecordingCalc(gamma_scale=0.25), False, True)
+    assert cols["energy_predicted"] == [1.0, 4.0, 2.0]
+    assert [g.tolist() for g in cols["gamma"]] == [[0.25], [1.0] * 4, [0.5] * 2]
+    # stress is tolerated: RecordingCalc does not implement it, so ASE raises
+    # PropertyNotImplementedError and the column is all-None
+    assert all(s is None for s in cols["stress_predicted"])
+
+
+def test_predict_columns_omits_columns_the_model_never_produced():
+    """Downstream `select.py` tests for column PRESENCE, so an absent UQ output
+    must not appear as an all-None column."""
+    from tensorpotential.uq.cli.predict import _predict_columns
+
+    cols = _predict_columns([_make_atoms("H", n=2)], RecordingCalc(), False, True)
+    assert "gamma" in cols  # RecordingCalc provides it
+    assert "sigma" not in cols  # ... but never atomic_sigma
+    assert uq_constants.FEATURES not in cols  # save_features=False
+
+
+def test_predict_columns_failed_structure_is_none_in_every_column():
+    from tensorpotential.uq.cli.predict import _predict_columns
+
+    atoms = [_make_atoms("H", n=n) for n in (1, 4, 2)]
+    cols = _predict_columns(atoms, RecordingCalc(fail_on=(4,)), False, False)
+    assert cols["energy_predicted"] == [1.0, None, 2.0]
+    assert cols["forces_predicted"][1] is None
+    assert cols["gamma"][1] is None
+
+
+def test_predict_columns_raise_errors_propagates():
+    from tensorpotential.uq.cli.predict import _predict_columns
+
+    with pytest.raises(RuntimeError):
+        _predict_columns(
+            [_make_atoms("H", n=n) for n in (1, 4)],
+            RecordingCalc(fail_on=(4,)),
+            False,
+            True,
+        )
