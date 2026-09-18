@@ -257,3 +257,20 @@ def test_batched_dfdq_matches_the_single_structure_path():
     assert label.shape[0] == weight.shape[0] >= n_real
     assert np.all(weight[n_real:] == 0.0), "padded atoms must carry zero weight"
     assert np.all(weight[:n_real] == 1.0)
+
+
+def test_predict_bec_can_be_switched_on_from_input_yaml():
+    """gracemaker builds a compute function as `Cls(compute_function_config=...)`
+    and forwards nothing else, so that dict is the only route from the YAML."""
+    from tensorpotential.extra.charge.model import ComputeBatchEnergyForcesCharge
+
+    assert not ComputeBatchEnergyForcesCharge().predict_bec
+    assert not ComputeBatchEnergyForcesCharge(compute_function_config={}).predict_bec
+    assert ComputeBatchEnergyForcesCharge(
+        compute_function_config={"predict_bec": True}
+    ).predict_bec
+    # the explicit keyword still works, for the tests and the ASE calculator
+    assert ComputeStructureEnergyForcesVirialCharge(predict_bec=True).predict_bec
+    assert ComputeStructureEnergyForcesVirialCharge(
+        compute_function_config={"predict_bec": True}
+    ).predict_bec

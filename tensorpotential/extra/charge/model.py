@@ -651,6 +651,20 @@ _CHARGE_SPECS = {
 }
 
 
+def _wants_bec(predict_bec, compute_function_config):
+    """`predict_bec` from either the constructor or input.yaml.
+
+    gracemaker builds a compute function as `Cls(compute_function_config=...)`
+    and never forwards anything else, so the YAML route has to go through that
+    dict -- the convention `extra/gen_tensor/model.py` already follows. The
+    explicit keyword stays for direct construction, which is how the tests and
+    the ASE calculator build these.
+    """
+    if compute_function_config:
+        return bool(compute_function_config.get("predict_bec", predict_bec))
+    return bool(predict_bec)
+
+
 def _densify(g):
     """FiLM reaches the charge through `tf.gather`, whose gradient is sparse.
 
@@ -784,10 +798,11 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
     }
 
     def __init__(self, extra_return_keys: list[str] = None,
-                 predict_bec: bool = False, **kwargs):
+                 predict_bec: bool = False, compute_function_config: dict = None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.extra_return_keys = extra_return_keys
-        self.predict_bec = predict_bec
+        self.predict_bec = _wants_bec(predict_bec, compute_function_config)
 
     def __call__(
         self,
@@ -843,10 +858,11 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
     }
 
     def __init__(self, extra_return_keys: list[str] = None,
-                 predict_bec: bool = False, **kwargs):
+                 predict_bec: bool = False, compute_function_config: dict = None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.extra_return_keys = extra_return_keys
-        self.predict_bec = predict_bec
+        self.predict_bec = _wants_bec(predict_bec, compute_function_config)
 
     def __call__(
         self,
@@ -909,11 +925,12 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
     }
 
     def __init__(self, local=False, extra_return_keys: list[str] = None,
-                 predict_bec: bool = False, **kwargs):
+                 predict_bec: bool = False, compute_function_config: dict = None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.local = local
         self.extra_return_keys = extra_return_keys
-        self.predict_bec = predict_bec
+        self.predict_bec = _wants_bec(predict_bec, compute_function_config)
         if self.local:
             self.specs[constants.ATOMIC_MU_I_LOCAL] = {"shape": [None], "dtype": "int"}
 
