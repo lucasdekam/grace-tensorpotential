@@ -651,6 +651,77 @@ _CHARGE_SPECS = {
 }
 
 
+def _densify(g):
+    """FiLM reaches the charge through `tf.gather`, whose gradient is sparse.
+
+    The tape hands back `IndexedSlices` rather than a `Tensor`, which every
+    downstream consumer -- the loss, the metrics, `.numpy()`, and a second
+    tape differentiating it again -- fails on.
+    """
+    return tf.convert_to_tensor(g) if isinstance(g, tf.IndexedSlices) else g
+
+
+def _tape_energy_forces_charge_bec(instructions, input_data, training, local=False):
+    """Two reverse sweeps: forces and dE/dq, then dF/dq and d2E/dq2.
+
+    The second derivative is taken through the *scalar* dE/dq rather than as a
+    Jacobian of the forces:
+
+        dF/dq = -d2E/(dr dq) = -d/dr (dE/dq)
+
+    so it is one more ordinary reverse sweep, the same shape GRACE already uses
+    for the forces themselves. Differentiating the [n_atoms, 3] forces w.r.t. q
+    directly would need forward mode, and `tf.autodiff.ForwardAccumulator`
+    cannot handle the `IndexedSlices` that FiLM's gather produces -- it raises
+    `'IndexedSlices' object has no attribute '_id'` inside the inner tape.
+
+    `d2E/dq2` is the second source of that same outer sweep, so it costs
+    nothing on top.
+
+    Returns `(e_atomic, pair_f, dE_dq, pair_df_dq, d2E_dq2)`, with the last
+    three None when the graph does not depend on the charge -- which happens
+    if one of these compute functions is paired with a model that has no FiLM
+    instruction.
+    """
+    bond = input_data[constants.BOND_VECTOR]
+    q = input_data[constants.TOTAL_CHARGE]
+
+    with tf.GradientTape() as outer:
+        outer.watch(bond)
+        outer.watch(q)
+        with tf.GradientTape() as inner:
+            inner.watch(bond)
+            inner.watch(q)
+            execute_instructions(input_data, instructions, training, local=local)
+            e_atomic = tf.reshape(input_data[constants.PREDICT_ATOMIC_ENERGY], [-1, 1])
+        g_bond, g_q = inner.gradient(e_atomic, [bond, q])
+        g_q = None if g_q is None else _densify(g_q)
+
+    pair_f = tf.negative(g_bond)
+    e_atomic = tf.cast(e_atomic, dtype=pair_f.dtype)
+    if g_q is None:
+        return e_atomic, pair_f, None, None, None
+
+    g_bond2, d2 = outer.gradient(g_q, [bond, q])
+    pair_df_dq = tf.negative(_densify(g_bond2))
+    return (
+        e_atomic,
+        pair_f,
+        tf.cast(g_q, dtype=pair_f.dtype),
+        tf.cast(pair_df_dq, dtype=pair_f.dtype),
+        tf.cast(_densify(d2), dtype=pair_f.dtype),
+    )
+
+
+def _pair_to_atom(input_data, pair, nat):
+    """The same bond-to-atom contraction the forces use."""
+    return tf.math.unsorted_segment_sum(
+        pair, input_data[constants.BOND_IND_J], num_segments=nat
+    ) - tf.math.unsorted_segment_sum(
+        pair, input_data[constants.BOND_IND_I], num_segments=nat
+    )
+
+
 def _tape_energy_forces_charge(instructions, input_data, training, local=False):
     """One tape, one reverse sweep, both gradients.
 
@@ -680,9 +751,7 @@ def _tape_energy_forces_charge(instructions, input_data, training, local=False):
         # a structure's atoms), and the gradient of a gather is *sparse*, so the
         # tape hands back IndexedSlices rather than a Tensor. Densify it, or
         # every downstream consumer -- loss, metrics, .numpy() -- breaks.
-        if isinstance(g_q, tf.IndexedSlices):
-            g_q = tf.convert_to_tensor(g_q)
-        g_q = tf.cast(g_q, dtype=pair_f.dtype)
+        g_q = tf.cast(_densify(g_q), dtype=pair_f.dtype)
     return e_atomic, pair_f, g_q
 
 
@@ -714,9 +783,11 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
         **_CHARGE_SPECS,
     }
 
-    def __init__(self, extra_return_keys: list[str] = None, **kwargs):
+    def __init__(self, extra_return_keys: list[str] = None,
+                 predict_bec: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.extra_return_keys = extra_return_keys
+        self.predict_bec = predict_bec
 
     def __call__(
         self,
@@ -724,9 +795,14 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
         input_data: dict,
         training: bool = False,
     ):
-        e_atomic, pair_f, dedq = _tape_energy_forces_charge(
-            instructions, input_data, training
-        )
+        if self.predict_bec:
+            e_atomic, pair_f, dedq, pair_dfdq, d2 = _tape_energy_forces_charge_bec(
+                instructions, input_data, training
+            )
+        else:
+            e_atomic, pair_f, dedq = _tape_energy_forces_charge(
+                instructions, input_data, training
+            )
         total_energy, total_f = _batch_energy_forces(input_data, e_atomic, pair_f)
         res = {
             constants.PREDICT_TOTAL_ENERGY: total_energy,
@@ -736,6 +812,15 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
                 tf.zeros_like(total_energy) if dedq is None else dedq
             ),
         }
+        if self.predict_bec:
+            nat = tf.reshape(input_data[constants.N_ATOMS_BATCH_TOTAL], [])
+            res[cc.PREDICT_DF_DQ] = (
+                tf.zeros_like(total_f) if pair_dfdq is None
+                else _pair_to_atom(input_data, pair_dfdq, nat)
+            )
+            res[cc.PREDICT_D2E_DQ2] = (
+                tf.zeros_like(total_energy) if d2 is None else d2
+            )
         if self.extra_return_keys:
             for k in self.extra_return_keys:
                 if k in input_data:
@@ -757,9 +842,11 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
         **_CHARGE_SPECS,
     }
 
-    def __init__(self, extra_return_keys: list[str] = None, **kwargs):
+    def __init__(self, extra_return_keys: list[str] = None,
+                 predict_bec: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.extra_return_keys = extra_return_keys
+        self.predict_bec = predict_bec
 
     def __call__(
         self,
@@ -767,9 +854,14 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
         input_data: dict,
         training: bool = False,
     ):
-        e_atomic, pair_f, dedq = _tape_energy_forces_charge(
-            instructions, input_data, training
-        )
+        if self.predict_bec:
+            e_atomic, pair_f, dedq, pair_dfdq, d2 = _tape_energy_forces_charge_bec(
+                instructions, input_data, training
+            )
+        else:
+            e_atomic, pair_f, dedq = _tape_energy_forces_charge(
+                instructions, input_data, training
+            )
         total_energy, total_f = _batch_energy_forces(input_data, e_atomic, pair_f)
         res = {
             constants.PREDICT_TOTAL_ENERGY: total_energy,
@@ -782,6 +874,15 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
                 tf.zeros_like(total_energy) if dedq is None else dedq
             ),
         }
+        if self.predict_bec:
+            nat = tf.reshape(input_data[constants.N_ATOMS_BATCH_TOTAL], [])
+            res[cc.PREDICT_DF_DQ] = (
+                tf.zeros_like(total_f) if pair_dfdq is None
+                else _pair_to_atom(input_data, pair_dfdq, nat)
+            )
+            res[cc.PREDICT_D2E_DQ2] = (
+                tf.zeros_like(total_energy) if d2 is None else d2
+            )
         if self.extra_return_keys:
             for k in self.extra_return_keys:
                 if k in input_data:
@@ -807,10 +908,12 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         **_CHARGE_SPECS,
     }
 
-    def __init__(self, local=False, extra_return_keys: list[str] = None, **kwargs):
+    def __init__(self, local=False, extra_return_keys: list[str] = None,
+                 predict_bec: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.local = local
         self.extra_return_keys = extra_return_keys
+        self.predict_bec = predict_bec
         if self.local:
             self.specs[constants.ATOMIC_MU_I_LOCAL] = {"shape": [None], "dtype": "int"}
 
@@ -820,16 +923,17 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
         input_data: dict,
         training: bool = False,
     ):
-        e_atomic, pair_f, dedq = _tape_energy_forces_charge(
-            instructions, input_data, training, local=self.local
-        )
+        if self.predict_bec:
+            e_atomic, pair_f, dedq, pair_dfdq, d2 = _tape_energy_forces_charge_bec(
+                instructions, input_data, training, local=self.local
+            )
+        else:
+            e_atomic, pair_f, dedq = _tape_energy_forces_charge(
+                instructions, input_data, training, local=self.local
+            )
         total_energy = tf.reduce_sum(e_atomic, axis=0, keepdims=True)
         nat = tf.shape(input_data[constants.ATOMIC_MU_I])[0]
-        total_f = tf.math.unsorted_segment_sum(
-            pair_f, input_data[constants.BOND_IND_J], num_segments=nat
-        ) - tf.math.unsorted_segment_sum(
-            pair_f, input_data[constants.BOND_IND_I], num_segments=nat
-        )
+        total_f = _pair_to_atom(input_data, pair_f, nat)
         res = {
             constants.PREDICT_TOTAL_ENERGY: total_energy,
             constants.PREDICT_FORCES: total_f,
@@ -842,6 +946,14 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
             ),
             "z_" + constants.PREDICT_PAIR_FORCES: pair_f,
         }
+        if self.predict_bec:
+            res[cc.PREDICT_DF_DQ] = (
+                tf.zeros_like(total_f) if pair_dfdq is None
+                else _pair_to_atom(input_data, pair_dfdq, nat)
+            )
+            res[cc.PREDICT_D2E_DQ2] = (
+                tf.zeros_like(total_energy) if d2 is None else d2
+            )
         if self.extra_return_keys:
             for k in self.extra_return_keys:
                 if k in input_data:
