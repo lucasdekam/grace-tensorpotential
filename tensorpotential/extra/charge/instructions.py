@@ -37,8 +37,10 @@ from __future__ import annotations
 import tensorflow as tf
 
 from tensorpotential import constants
+from tensorpotential.extra.charge import constants as cc
 from tensorpotential.functions.nn import FullyConnectedMLP
 from tensorpotential.instructions.base import TPInstruction, capture_init_args
+from tensorpotential.instructions.output import CreateOutputTarget, TPOutputInstruction
 
 
 @capture_init_args
@@ -240,3 +242,251 @@ class FiLMChargeScalar(TPInstruction):
             beta = beta * mask
 
         return x * (1.0 + gamma) + beta
+
+
+@capture_init_args
+class HelmholtzChargeTarget(TPOutputInstruction):
+    r"""Impose RAZOR's capacitor expansion on the energy's charge dependence.
+
+    Adds to the per-atom energy target
+
+        E_i += (q / (eps0 A)) * p_z,i  +  [q phi_ref + q^2 / (2 C_0)] / N_real
+
+    so that, summed over a structure's atoms,
+
+        E(q) = E_0 + phi_0 q + q^2 / (2 C_0),
+        phi_0 = phi_ref + P_z / (eps0 A),        P_z = sum_i p_z,i
+
+    which is Eq. (1) of Bergmann, Reuter & Hoermann, J. Chem. Phys. 164,
+    174110 (2026), with `phi_0` expressed through their Helmholtz relation,
+    Eq. (4): P_z = eps0 A (phi_0 - phi_ref).
+
+    Unlike `FiLMChargeScalar`, which leaves E(q) an arbitrary learned function,
+    this makes E(q) *exactly* quadratic. Three consequences:
+
+    - `dE/dq = phi_0 + q / C_0` and `d2E/dq2 = 1/C_0` exactly, so the curvature
+      is a parameter rather than a by-product, and E(q) extrapolates in charge
+      by construction rather than by whatever an MLP does off-distribution.
+    - `dF_I/dq = -d(P_z)/dR_I` is independent of q, i.e. the SEBEC is the
+      gradient of a learned polarization. This is the same structure as
+      Z*_I = V dP/dR_I in the modern theory of polarization; the `eps0 A`
+      cancels out of the response entirely.
+    - The head is exactly padding-invariant (see PADDING below).
+
+    WHY P_z RATHER THAN phi_0 DIRECTLY
+    ----------------------------------
+    `phi_0` is intensive, so it cannot be written as a plain sum over atoms; a
+    mean-pooled `phi_0` would instead make every SEBEC scale as 1/N, which is
+    wrong for a per-atom response of order e. `P_z` is a dipole: extensive,
+    short-ranged, and the natural thing for an MLIP readout to sum. Intensivity
+    of `phi_0` is then *derived*, through the 1/A. Adding slab thickness adds
+    atoms with p_i ~ 0; doubling the area doubles P_z and A together.
+
+    EQUIVARIANCE
+    ------------
+    `origin` must be l=1 with odd parity (`FunctionReduceParticular(selected_l=1,
+    selected_p=-1)`), i.e. a true vector, not a pseudovector. This is not
+    decoration: under a global mirror z -> -z every invariant descriptor is
+    unchanged but P_z must flip sign, so an invariant readout could only
+    memorise the fixed slab orientation of its training set.
+
+    Parameters
+    ----------
+    origin : list[FunctionReduceParticular]
+        l=1 instructions producing `[n_atoms, n_out, 3]`. Their contributions
+        are summed, so a linear reduce and a gated one can be passed together
+        to get the same linear/non-linear split `LinMLPOut2ScalarTarget` uses
+        for the energy.
+    area : float
+        Surface area in Angstrom^2, used for the `1/(eps0 A)` conversion of
+        `P_z` to a potential.
+
+        **A fixed float, deliberately, not a tensor read from the cell.** The
+        LAMMPS pair style (`src/ML-PACE/pair_grace.cpp`) feeds no cell or box
+        input at all, so a model that requested `CELL_VECTORS` could not be run
+        there. razor's cell is fixed at 82.31 A^2, so nothing is lost today.
+
+        TODO: make the area part of the E(q) expression and obtain it at
+        inference, so the model conditions on the surface charge density
+        sigma = q/A instead of q and transfers across cell sizes. Two changes:
+        this term's `1/(eps0 A)` becomes tensor-valued, and `inv_capacitance`
+        (V/e, cell-specific) becomes an intensive `c_inv` in V A^2 / e with the
+        capacitive energy `q^2 c_inv / (2 A)`. The blocker is on the LAMMPS
+        side -- `pair_grace.cpp` needs to feed `cell_vectors` from `domain`
+        before the instruction can request it. `FiLMChargeScalar`'s
+        `normalize="per_area"` branch already has the `cross(cell[i], cell[j])`
+        code to reuse. See notes/interim-report.md section 6 item 6 in
+        lorem-q-work, which records this as a project-level intention.
+    slab_normal_axis : int
+        Cartesian component of the dipole that couples to the charge. **Explicit,
+        never inferred from the cell** -- inferring it is how a silent 2.54x
+        error in Born effective charges arose in a sibling project; see the
+        same argument in `FiLMChargeScalar`.
+    phi_ref : float
+        Initial value of the reference work function in V, the `phi_0^ref` of
+        Eq. (4). 5.75 V is the paper's clean Pt(111)-in-SJM value.
+
+        This is a *conditioning device, not capacity*: it is exactly degenerate
+        with a constant in `sum_i p_z,i`, so training it only lets it absorb the
+        dataset mean. What it buys is the starting point -- with a
+        zero-initialised dipole readout the model begins at
+        `phi = phi_ref + q/C_0` and has only the small residual dipole left to
+        learn, instead of having to build ~5 V out of a sum of atomic
+        contributions. Same role `TrainableShiftTarget` plays for the energy.
+    inv_capacitance : float
+        Initial value of `1/C_0` in V/e. Unlike `phi_ref` this is *not*
+        degenerate: it is what the `d2E/dq2` label pins directly. 9.16 V/e is
+        the mean over `razor_centre.xyz` restricted to `polarizable=True`
+        (+- 1.02 over 5398 frames, i.e. genuinely near structure-independent,
+        which is what makes a single scalar defensible). Outside that window
+        the label is a different number, not just a noisier one.
+
+        Kept structure-independent on purpose. RAZOR assumes the same ("thus
+        having no effect on forces"), and experiments/razor_quad/ in
+        lorem-q-work records that a geometry-dependent per-atom curvature
+        collapses to a constant and explains none of the variation, while a
+        single global one had the best forces of that family.
+
+    INITIALISATION
+    --------------
+    `FunctionReduceParticular` initialises its coefficients from a unit normal,
+    so an untouched dipole readout emits a large *random* `P_z` -- measured at
+    5.7 V RMS on the work function, against a label spread of ~1.2 V. That would
+    swamp `phi_ref` and make its careful initial value pointless.
+
+    So `dipole_scale` multiplies `P_z` and is initialised to **zero**, the same
+    trick `FiLMChargeScalar.gate` and `InvariantLayerRMSNorm(init="zeros")` use.
+    At step 0 the model is therefore exactly the bare capacitor,
+    `phi = phi_ref + q / C_0`, which is the prior `phi_ref` exists to express.
+    `dipole_scale` picks up a gradient immediately (dL/dscale is proportional to
+    P_z, which is nonzero), and the reduce coefficients start moving as soon as
+    it leaves zero.
+
+    PADDING
+    -------
+    `p_z` is already exactly zero on a padded atom: its descriptors are zero,
+    the reduce is linear without bias, and a gate multiplies rather than shifts.
+    The charge-only bracket is not, so it is masked on `N_ATOMS_BATCH_REAL` and
+    divided by the number of *real* atoms in the structure. Exactly `N_real`
+    atoms then contribute `1/N_real` of it, so the structure total is exactly
+    `q phi_ref + q^2 / (2 C_0)` at any padding width.
+
+    That makes this head padding-exact, which FiLM is not -- see the note in
+    `FiLMChargeScalar.frwrd` and the `padding 0` advice in LAMMPS'
+    doc/src/pair_grace.rst. Do not rely on it without the test; verify it.
+    """
+
+    def __init__(
+        self,
+        origin: list,
+        target: CreateOutputTarget,
+        area: float,
+        slab_normal_axis: int = 2,
+        phi_ref: float = 5.75,
+        inv_capacitance: float = 9.16,
+        train_phi_ref: bool = True,
+        train_inv_capacitance: bool = True,
+        name: str = "HelmholtzChargeTarget",
+        l: int = 0,  # noqa: E741
+        **kwargs,
+    ):
+        super().__init__(name=name, target=target, l=l)
+
+        assert slab_normal_axis in (0, 1, 2), "slab_normal_axis must be 0, 1 or 2"
+        assert area > 0, f"area must be positive, got {area}"
+        lmax = max(ins.lmax for ins in origin)
+        assert lmax == 1, (
+            f"HelmholtzChargeTarget needs l=1 (vector) origins, got lmax={lmax}. "
+            f"Use FunctionReduceParticular(selected_l=1, selected_p=-1)."
+        )
+        self.assert_l_compatibility(target)
+
+        self.origin = origin
+        self.area = area
+        self.slab_normal_axis = slab_normal_axis
+        self.phi_ref_init = phi_ref
+        self.inv_capacitance_init = inv_capacitance
+        self.train_phi_ref = train_phi_ref
+        self.train_inv_capacitance = train_inv_capacitance
+
+        # Instance attribute rather than class attribute, so the requested keys
+        # stay as narrow as possible -- the pattern FiLMChargeScalar uses. All
+        # three are already fed by the LAMMPS pair style; `CELL_VECTORS`
+        # deliberately is not requested (see `area` above).
+        self.input_tensor_spec = {
+            constants.TOTAL_CHARGE: {"shape": [None, 1], "dtype": "float"},
+            constants.ATOMS_TO_STRUCTURE_MAP: {"shape": [None], "dtype": "int"},
+            constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
+        }
+
+    @tf.Module.with_name_scope
+    def build(self, float_dtype):
+        if self.is_built:
+            return
+        self.phi_ref = tf.Variable(
+            tf.constant(self.phi_ref_init, dtype=float_dtype),
+            trainable=self.train_phi_ref,
+            name="phi_ref",
+        )
+        self.inv_capacitance = tf.Variable(
+            tf.constant(self.inv_capacitance_init, dtype=float_dtype),
+            trainable=self.train_inv_capacitance,
+            name="inv_capacitance",
+        )
+        # zero-init => P_z is exactly 0 at step 0, so the model starts as the
+        # bare capacitor phi_ref + q/C_0 (see INITIALISATION above)
+        self.dipole_scale = tf.Variable(
+            tf.zeros([], dtype=float_dtype), name="dipole_scale"
+        )
+        self.is_built = True
+
+    def frwrd(self, input_data, training=False, local=False):
+        target = input_data[f"{self.target.name}"]
+
+        p = 0.0
+        for ins in self.origin:
+            x = input_data[f"{ins.name}"]
+            if getattr(ins, "lm_first", False):
+                # [lm, atoms, n_out] -> [atoms, n_out, lm]
+                x = tf.transpose(x, [1, 2, 0])
+            # real spherical harmonics run m = -1, 0, +1, i.e. (y, z, x); the
+            # roll is the same (y,z,x) -> (x,y,z) reorder LinearOut2EquivarTarget
+            # applies, so slab_normal_axis indexes Cartesian components.
+            p += tf.reduce_sum(tf.roll(x, shift=1, axis=2), axis=1)
+        pz = p[:, self.slab_normal_axis : self.slab_normal_axis + 1]
+        pz = pz * tf.cast(self.dipole_scale, pz.dtype)
+
+        q = tf.cast(input_data[constants.TOTAL_CHARGE], pz.dtype)
+        map_at2struc = input_data[constants.ATOMS_TO_STRUCTURE_MAP]
+        # each structure's charge, broadcast to its atoms. Padded atoms gather a
+        # real structure's charge (LAMMPS maps every atom to structure 0), which
+        # is why the bracket below has to be masked.
+        q_at = tf.gather(q, map_at2struc)
+
+        real = (
+            tf.reshape(tf.range(tf.shape(pz)[0], dtype=tf.int32), [-1, 1])
+            < input_data[constants.N_ATOMS_BATCH_REAL]
+        )
+        ones = tf.where(real, tf.ones_like(q_at), tf.zeros_like(q_at))
+        n_real = tf.math.unsorted_segment_sum(
+            ones, map_at2struc, num_segments=tf.shape(q)[0]
+        )
+        n_real_at = tf.gather(n_real, map_at2struc)
+
+        eps0_area = tf.constant(cc.EPSILON_0, dtype=pz.dtype) * tf.constant(
+            self.area, dtype=pz.dtype
+        )
+        phi_ref = tf.cast(self.phi_ref, pz.dtype)
+        inv_c = tf.cast(self.inv_capacitance, pz.dtype)
+
+        # geometry-dependent: q * P_z / (eps0 A). Already exactly zero on padded
+        # atoms -- their descriptors are zero and the reduce is linear without a
+        # bias -- so this term needs no mask of its own.
+        dipole_term = q_at / eps0_area * pz
+        # charge-only: q phi_ref + q^2 / (2 C_0), spread over the REAL atoms of
+        # each structure so the structure total is exact at any padding width
+        const_term = q_at * phi_ref + 0.5 * inv_c * tf.square(q_at)
+        const_term = tf.math.divide_no_nan(const_term, n_real_at)
+        const_term = tf.where(real, const_term, tf.zeros_like(const_term))
+
+        return target + dipole_term + const_term
