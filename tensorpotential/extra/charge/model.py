@@ -22,14 +22,19 @@ import tensorflow as tf
 
 from tensorpotential import constants
 from tensorpotential.extra.charge import constants as cc
-from tensorpotential.extra.charge.instructions import FiLMChargeScalar
+from tensorpotential.extra.charge.instructions import (
+    FiLMChargeScalar,
+    HelmholtzChargeTarget,
+)
 from tensorpotential.instructions import (
     BondLength,
     BondSpecificRadialBasisFunction,
     ConstantScaleShiftTarget,
     CreateOutputTarget,
+    EquivariantGate,
     FCRight2Left,
     FunctionReduceN,
+    FunctionReduceParticular,
     InstructionManager,
     InvariantLayerRMSNorm,
     LinMLPOut2ScalarTarget,
@@ -638,6 +643,447 @@ def GRACE_2LAYER_FILM(
 
     # `I_out_0_LN` is still the layer-1 tensor communicated across the multi-GPU
     # graph split; the FiLM that consumes it lives in the second half.
+    instructor.communicated_keys = ["I_out_0_LN", "I"]
+    return instructor
+
+
+@register_preset(
+    "GRACE_2LAYER_HELMHOLTZ",
+    public=True,
+    settings={
+        "small": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 1,
+            "n_rad_max": [32, 32],
+            "prod_func_n_max": [32, 32],
+            "n_mlp_dens": 12,
+            "n_rad_base": 8,
+        },
+        "medium": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 1,
+            "n_rad_max": [42, 32],
+            "prod_func_n_max": [42, 64],
+            "n_mlp_dens": 16,
+            "n_rad_base": 10,
+        },
+        "large": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 3,
+            "n_rad_max": [42, 32],
+            "prod_func_n_max": [42, 64],
+            "n_mlp_dens": 16,
+            "n_rad_base": 10,
+        },
+    },
+)
+def GRACE_2LAYER_HELMHOLTZ(
+    element_map: dict,
+    rcut: float = 6,
+    avg_n_neigh: float = 1.0,
+    constant_out_shift: float = 0.0,
+    constant_out_scale: float = 1.0,
+    lmax=(4, 3),
+    basis_type: str = "Cheb",
+    cutoff_function_order: int = 16,
+    n_rad_base=10,
+    n_rad_max=(42, 32),
+    prod_func_n_max=(42, 64),
+    embedding_size=128,
+    n_mlp_dens: int = 16,
+    max_order: int = 4,
+    indicator_lmax: int = 3,
+    func_init="random",
+    chem_init="random",
+    cutoff_dict: dict = None,
+    atomic_shift_map: dict = None,
+    zbl_cutoff: dict = None,
+    dense_nbr: bool = False,
+    charge_area: float = None,
+    slab_normal_axis: int = 2,
+    charge_phi_ref: float = 5.75,
+    charge_inv_capacitance: float = 9.16,
+    charge_train_phi_ref: bool = True,
+    charge_train_inv_capacitance: bool = True,
+    dipole_gate_hidden: int = 16,
+    **kwargs,
+) -> InstructionManager:
+    """`GRACE_2LAYER_v2_25` with RAZOR's capacitor expansion in place of FiLM.
+
+    The scalar energy readout is the stock `LinMLPOut2ScalarTarget` over
+    `I_out_0_LN` and `I_1_LN`, untouched, and gives `E_0(R)`. A second,
+    *equivariant* readout produces per-atom dipoles whose z-component sums to the
+    interfacial polarization `P_z`, and `HelmholtzChargeTarget` couples it to the
+    charge as
+
+        E(q) = E_0 + phi_0 q + q^2 / (2 C_0),   phi_0 = phi_ref + P_z / (eps0 A)
+
+    so E(q) is *exactly* quadratic. Contrast `GRACE_2LAYER_FILM`, where E(q) is
+    an arbitrary learned function: here `d2E/dq2` is a parameter rather than a
+    by-product, and extrapolation in charge is fixed by the functional form
+    rather than by whatever an MLP does off-distribution.
+
+    There is deliberately **no FiLM** here. The two mechanisms compose, but then
+    E(q) stops being quadratic and `1/C_0` stops meaning anything; keep them as
+    separate presets so an experiment says which one it is testing.
+
+    The dipole branch reads the second layer's equivariant instructions (`B`,
+    `BB`; `BBB`/`BBBB` are built with `Lmax=0` and carry no l=1 block) twice: a
+    plain linear contraction, and one through `EquivariantGate`. That mirrors the
+    linear-passthrough + MLP split `LinMLPOut2ScalarTarget` uses for the energy,
+    and keeps a linear-ACE-like term as an exact subspace of the polarization --
+    which, since the SEBEC is `-d(P_z)/dR`, is what puts a linear term in the
+    charge response too.
+
+    `charge_area` is REQUIRED: it is the surface area in Angstrom^2 used to
+    convert `P_z` to a potential. It is a fixed number rather than something read
+    from the cell because the LAMMPS pair style feeds no cell input; see the TODO
+    in `HelmholtzChargeTarget`.
+    """
+    if isinstance(lmax, int):
+        lmax = [lmax, lmax]
+    if isinstance(n_rad_max, int):
+        n_rad_max = [n_rad_max, n_rad_max]
+    if isinstance(prod_func_n_max, int):
+        prod_func_n_max = [prod_func_n_max, prod_func_n_max]
+
+    assert prod_func_n_max[0] == n_rad_max[0], (
+        f"n_rad_max[0] and prod_func_n_max[0] must match, "
+        f"but {n_rad_max[0]} and {prod_func_n_max[0]} instead."
+    )
+    Il = indicator_lmax
+    num_elements = len(element_map)
+    assert charge_area is not None, (
+        "GRACE_2LAYER_HELMHOLTZ needs `charge_area`, the surface area in A^2 "
+        "used to convert the interfacial polarization to a potential. There is "
+        "no sensible default and getting it wrong rescales every work function."
+    )
+    charge_kwargs = dict(
+        area=charge_area,
+        slab_normal_axis=slab_normal_axis,
+        phi_ref=charge_phi_ref,
+        inv_capacitance=charge_inv_capacitance,
+        train_phi_ref=charge_train_phi_ref,
+        train_inv_capacitance=charge_train_inv_capacitance,
+    )
+    with InstructionManager(dense_nbr=dense_nbr) as instructor:
+        d_ij = BondLength()
+        rhat = ScaledBondVector(bond_length=d_ij)
+
+        if cutoff_dict is None:
+            g_k = RadialBasis(
+                bonds=d_ij,
+                basis_type=basis_type,
+                nfunc=n_rad_base,
+                p=cutoff_function_order,
+                normalized=False,
+                rcut=rcut,
+            )
+        else:
+            g_k = BondSpecificRadialBasisFunction(
+                bonds=d_ij,
+                element_map=element_map,
+                cutoff_dict=cutoff_dict,
+                cutoff=rcut,
+                cutoff_type="symmetric_bond",
+                cutoff_function_param=cutoff_function_order,
+                basis_type=basis_type,
+                nfunc=n_rad_base,
+            )
+
+        Y = SphericalHarmonic(vhat=rhat, lmax=lmax[0], name="Y")
+        z = ScalarChemicalEmbedding(
+            element_map=element_map,
+            embedding_size=embedding_size,
+            name="Z",
+            init=chem_init,
+        )
+
+        R_nl = MLPRadialFunction_v2(
+            n_rad_max=n_rad_max[0],
+            lmax=lmax[0],
+            basis=g_k,
+            name="R",
+            hidden_layers=[64, 64],
+            activation=["silu", "silu"],
+        )
+
+        A = SingleParticleBasisFunctionScalarInd(
+            radial=R_nl, angular=Y, indicator=z, name="A", avg_n_neigh=avg_n_neigh
+        )
+
+        instructions = [A]
+
+        if max_order > 1:
+            A1 = FCRight2Left(
+                left=A, right=A, name="A1", n_out=prod_func_n_max[0], norm_out=True
+            )
+            AA = ProductFunction(
+                left=A1,
+                right=A1,
+                name="AA",
+                lmax=lmax[0],
+                Lmax=lmax[0],
+                keep_parity=Parity.REAL_PARITY,
+                is_left_right_equal=True,
+                normalize=True,
+            )
+            instructions.append(AA)
+
+        if max_order > 2:
+            AA1 = FCRight2Left(
+                left=AA,
+                right=A,
+                name="AA1",
+                n_out=prod_func_n_max[0],
+                norm_out=True,
+            )
+            AAA = ProductFunction(
+                left=AA1,
+                right=A,
+                name="AAA",
+                lmax=lmax[0],
+                Lmax=Il,
+                keep_parity=Parity.REAL_PARITY,
+                normalize=True,
+            )
+            instructions.append(AAA)
+        if max_order > 3:
+            AA2 = FCRight2Left(
+                left=AA,
+                right=A,
+                name="AA2",
+                n_out=prod_func_n_max[0],
+                norm_out=True,
+            )
+            AAAA = ProductFunction(
+                left=AA2,
+                right=AA2,
+                name="AAAA",
+                lmax=lmax[0],
+                Lmax=1 if Il > 0 else 0,
+                keep_parity=Parity.REAL_PARITY,
+                normalize=True,
+            )
+            instructions.append(AAAA)
+
+        I1 = FunctionReduceN(
+            name="I1",
+            instructions=instructions,
+            ls_max=[Il, Il, Il, 1 if Il > 0 else 0][: len(instructions)],
+            n_out=12,
+            is_central_atom_type_dependent=True,
+            number_of_atom_types=num_elements,
+            allowed_l_p=Parity.REAL_PARITY,
+        )
+
+        instr_red = FunctionReduceN(
+            name="I",
+            instructions=[I1],
+            ls_max=[Il],
+            n_out=n_rad_max[1],
+            is_central_atom_type_dependent=False,
+            allowed_l_p=Parity.REAL_PARITY,
+            init_vars=func_init,
+        )
+
+        I_0 = FunctionReduceN(
+            instructions=instructions,
+            name="I_out_0",
+            ls_max=0,
+            n_out=n_mlp_dens + 1,
+            is_central_atom_type_dependent=True,
+            number_of_atom_types=num_elements,
+            allowed_l_p=Parity.SCALAR,
+            init_vars=func_init,
+        )
+        I_0_LN = InvariantLayerRMSNorm(
+            inpt=I_0,
+            name="I_out_0_LN",
+            type="only_nonlin",
+        )
+
+        R1_nl = MLPRadialFunction_v2(
+            n_rad_max=n_rad_max[1],
+            lmax=lmax[0],
+            basis=g_k,
+            name="R1",
+            hidden_layers=[64, 64],
+            activation=["silu", "silu"],
+        )
+        B0 = SingleParticleBasisFunctionScalarInd(
+            radial=R1_nl,
+            angular=Y,
+            indicator=z,
+            name="B0",
+            avg_n_neigh=avg_n_neigh,
+        )
+
+        YI = SingleParticleBasisFunctionEquivariantInd(
+            radial=R1_nl,
+            angular=Y,
+            indicator=instr_red,
+            name="YI",
+            lmax=lmax[0],
+            Lmax=lmax[1],
+            avg_n_neigh=avg_n_neigh,
+            keep_parity=Parity.FULL_PARITY,
+            normalize=True,
+        )
+        B = FunctionReduceN(
+            instructions=[YI, B0],
+            name="B",
+            ls_max=lmax[1],
+            out_norm=False,
+            n_out=prod_func_n_max[1],
+            is_central_atom_type_dependent=False,
+            allowed_l_p=Parity.FULL_PARITY,
+        )
+        instructions2 = [B]
+
+        if max_order > 1:
+            B1 = FCRight2Left(
+                left=B,
+                right=B,
+                name="B1",
+                n_out=prod_func_n_max[1],
+                norm_out=True,
+            )
+            BB = ProductFunction(
+                left=B1,
+                right=B1,
+                name="BB",
+                lmax=lmax[1],
+                Lmax=lmax[1],
+                keep_parity=Parity.FULL_PARITY + [[0, -1]],
+                is_left_right_equal=True,
+                normalize=True,
+            )
+            instructions2.append(BB)
+        if max_order > 2:
+            BB1 = FCRight2Left(
+                left=BB,
+                right=B,
+                name="BB1",
+                n_out=prod_func_n_max[1],
+                norm_out=True,
+            )
+            BBB = ProductFunction(
+                left=BB1,
+                right=B,
+                name="BBB",
+                lmax=lmax[1],
+                Lmax=0,
+                keep_parity=Parity.REAL_PARITY,
+                normalize=True,
+            )
+            instructions2.append(BBB)
+        if max_order > 3:
+            BB2 = FCRight2Left(
+                left=BB,
+                right=B,
+                name="BB2",
+                n_out=prod_func_n_max[1],
+                norm_out=True,
+            )
+            BBBB = ProductFunction(
+                left=BB2,
+                right=BB2,
+                name="BBBB",
+                lmax=lmax[1],
+                Lmax=0,
+                keep_parity=Parity.REAL_PARITY,
+                normalize=True,
+            )
+            instructions2.append(BBBB)
+
+        I_1 = FunctionReduceN(
+            instructions=instructions2,
+            name="I_out_1",
+            ls_max=0,
+            n_out=n_mlp_dens + 1,
+            is_central_atom_type_dependent=True,
+            number_of_atom_types=num_elements,
+            allowed_l_p=Parity.SCALAR,
+            init_vars=func_init,
+        )
+        I_1_LN = InvariantLayerRMSNorm(
+            inpt=I_1,
+            name="I_1_LN",
+            type="full",
+        )
+
+        out_instr = CreateOutputTarget(name=constants.PREDICT_ATOMIC_ENERGY)
+        # E_0(R): identical to GRACE_2LAYER_v2_25, no charge anywhere in it
+        LinMLPOut2ScalarTarget(
+            origin=[I_0_LN, I_1_LN],
+            target=out_instr,
+            hidden_layers=[64],
+            activation="tanh",
+        )
+
+        # >>> the departure from GRACE_2LAYER_v2_25: the polarization branch <<<
+        # Only the l>=1 members of instructions2 can supply a vector -- BBB and
+        # BBBB are built with Lmax=0, and FunctionReduceParticular asserts every
+        # input has lmax >= selected_l.
+        dipole_src = [ins for ins in instructions2 if ins.lmax >= 1]
+        # selected_p=-1 is the true (odd-parity) vector. A pseudovector would be
+        # even under inversion and could not represent a dipole.
+        p_lin = FunctionReduceParticular(
+            instructions=dipole_src,
+            name="I_dipole_lin",
+            selected_l=1,
+            selected_p=-1,
+            n_out=1,
+            is_central_atom_type_dependent=True,
+            number_of_atom_types=num_elements,
+        )
+        dipole_origin = [p_lin]
+        if dipole_gate_hidden is not None:
+            p_gated = FunctionReduceParticular(
+                instructions=[
+                    EquivariantGate(
+                        input=ins,
+                        name=f"{ins.name}_dipole_gate",
+                        hidden_dim=dipole_gate_hidden,
+                    )
+                    for ins in dipole_src
+                ],
+                name="I_dipole_gated",
+                selected_l=1,
+                selected_p=-1,
+                n_out=1,
+                is_central_atom_type_dependent=True,
+                number_of_atom_types=num_elements,
+            )
+            dipole_origin.append(p_gated)
+        HelmholtzChargeTarget(
+            origin=dipole_origin, target=out_instr, **charge_kwargs
+        )
+        if (
+            (constant_out_shift != 0)
+            or (constant_out_scale != 1)
+            or (atomic_shift_map is not None)
+        ):
+            ConstantScaleShiftTarget(
+                target=out_instr,
+                scale=constant_out_scale,
+                shift=constant_out_shift,
+                atomic_shift_map=atomic_shift_map,
+            )
+        TrainableShiftTarget(target=out_instr, number_of_atom_types=num_elements)
+        if zbl_cutoff is not None:
+            zbl = ZBLPotential(bonds=d_ij, cutoff=zbl_cutoff, element_map=element_map)
+            LinearOut2Target(origin=[zbl], target=out_instr, name="zbl_output")
+
+    # `I_out_0_LN` is still the layer-1 tensor communicated across the multi-GPU
+    # graph split; the readout that consumes it lives in the second half.
     instructor.communicated_keys = ["I_out_0_LN", "I"]
     return instructor
 

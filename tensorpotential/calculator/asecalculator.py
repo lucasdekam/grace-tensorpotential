@@ -956,8 +956,9 @@ class TPCalculator(Calculator):
             self.data_builders.append(CellDataBuilder(cutoff=self.cutoff))
         if constants.TOTAL_CHARGE in self.data_keys:
             # Only reached by a charge-conditioned model: data_keys comes from
-            # model.compute_specs, and total_charge enters that only via a FiLM
-            # instruction's input_tensor_spec. Set the charge per structure with
+            # model.compute_specs, and total_charge enters that only via a
+            # FiLMChargeScalar or HelmholtzChargeTarget instruction's
+            # input_tensor_spec. Set the charge per structure with
             # atoms.info["total_charge"]; it defaults to 0.0 when absent.
             from tensorpotential.extra.charge.databuilder import (
                 TotalChargeDataBuilder,
