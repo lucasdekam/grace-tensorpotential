@@ -19,6 +19,13 @@ PREDICT_DF_DQ: Final[str] = "df_dq"
 # d2E/dq2, the inverse frozen-nuclei capacitance up to 1/A, in V/e. Free: it
 # is the second source of the same gradient call that produces df_dq.
 PREDICT_D2E_DQ2: Final[str] = "d2e_dq2"
+# A work function from its OWN readout head (DirectWorkFunction), not dE/dq.
+# When a model has one, the compute functions report it as PREDICT_WORK_FUNCTION
+# and the autograd dE/dq separately, as PREDICT_DE_DQ.
+PREDICT_WORK_FUNCTION_DIRECT: Final[str] = "work_function_direct"
+PREDICT_DE_DQ: Final[str] = "de_dq"
+# the per-atom target the direct head mean-pools
+ATOMIC_WORK_FUNCTION: Final[str] = "atomic_work_function"
 
 # Labels
 DATA_REFERENCE_WORK_FUNCTION: Final[str] = "true_work_function"

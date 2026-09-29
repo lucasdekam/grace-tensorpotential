@@ -490,3 +490,100 @@ class HelmholtzChargeTarget(TPOutputInstruction):
         const_term = tf.where(real, const_term, tf.zeros_like(const_term))
 
         return target + dipole_term + const_term
+
+
+@capture_init_args
+class DirectWorkFunction(TPInstruction):
+    r"""A work function from its own readout, not the charge derivative of the energy.
+
+        Phi(R, q) = phi_ref + s q + scale * <w_i(R, q)>_real atoms
+
+    where `w_i` is a per-atom scalar read out of the same FiLM-conditioned
+    invariant features the energy uses, but through its own MLP
+    (`atomic`, a `CreateOutputTarget` filled by `LinMLPOut2ScalarTarget`).
+    This is the "node augmentation" variant of Wang, Fang, Huang & Liu,
+    J. Chem. Theory Comput. 21, 7628 (2025): the charge enters the node
+    features, and a pooled readout of the invariant features gives the Fermi
+    level directly.
+
+    WHY
+    ---
+    With Phi = dE/dq, the work-function label and the energies at different
+    charges must agree, and for GPAW-SJM they do not: W - dE/dq = 0.28 +- 0.09 V
+    (lorem-q-work, experiments/razor_capacitance/sjm_consistency). A direct
+    head is free of that constraint. The energy's charge dependence is then
+    fitted to energies and forces alone, and Phi is a separate observable. For
+    constant-charge MD only E(R, q) and F(R, q) enter the dynamics, so nothing
+    is lost there; a constant-POTENTIAL scheme would need Phi = dE/dq and
+    should not use this head.
+
+    POOLING
+    -------
+    A mean over the REAL atoms of each structure: Phi is intensive, and the mean
+    is exactly padding-invariant (padded atoms are masked out of both the sum
+    and the count).
+
+    PRIOR AND INITIALISATION
+    ------------------------
+    `phi_ref + s q` is the bare-capacitor prior, `s` initialised at 1/C_0
+    (9.16 V/e on razor). `scale` multiplies the pooled readout and starts at
+    zero, the trick `HelmholtzChargeTarget.dipole_scale` and
+    `FiLMChargeScalar.gate` use, so a fresh model is exactly the prior and the
+    random initial readout cannot swamp it. All three are trainable by default;
+    `phi_ref` and `s` can be frozen.
+    """
+
+    def __init__(
+        self,
+        atomic: CreateOutputTarget,
+        name: str = cc.PREDICT_WORK_FUNCTION_DIRECT,
+        phi_ref: float = 5.0,
+        charge_slope: float = 9.16,
+        train_phi_ref: bool = True,
+        train_charge_slope: bool = True,
+        **kwargs,
+    ):
+        super().__init__(name=name)
+        assert name == cc.PREDICT_WORK_FUNCTION_DIRECT, (
+            f"the compute functions find this head by name; keep it "
+            f"{cc.PREDICT_WORK_FUNCTION_DIRECT!r}"
+        )
+        self.atomic = atomic
+        self.phi_ref_init = phi_ref
+        self.charge_slope_init = charge_slope
+        self.train_phi_ref = train_phi_ref
+        self.train_charge_slope = train_charge_slope
+        self.input_tensor_spec = {
+            constants.TOTAL_CHARGE: {"shape": [None, 1], "dtype": "float"},
+            constants.ATOMS_TO_STRUCTURE_MAP: {"shape": [None], "dtype": "int"},
+            constants.N_ATOMS_BATCH_REAL: {"shape": [], "dtype": "int"},
+        }
+
+    @tf.Module.with_name_scope
+    def build(self, float_dtype):
+        if self.is_built:
+            return
+        self.phi_ref = tf.Variable(tf.constant(self.phi_ref_init, dtype=float_dtype),
+                                   trainable=self.train_phi_ref, name="phi_ref")
+        self.charge_slope = tf.Variable(tf.constant(self.charge_slope_init, dtype=float_dtype),
+                                        trainable=self.train_charge_slope, name="charge_slope")
+        # zero-init => a fresh model is exactly phi_ref + s q
+        self.scale = tf.Variable(tf.zeros([], dtype=float_dtype), name="wf_scale")
+        self.is_built = True
+
+    def frwrd(self, input_data, training=False, local=False):
+        q = input_data[constants.TOTAL_CHARGE]
+        w = tf.reshape(input_data[self.atomic.name], [-1, 1])
+        w = tf.cast(w, q.dtype) * tf.ones([tf.shape(input_data[constants.ATOMS_TO_STRUCTURE_MAP])[0], 1], q.dtype)
+        map_at2struc = input_data[constants.ATOMS_TO_STRUCTURE_MAP]
+        n_struct = tf.shape(q)[0]
+        real = (
+            tf.reshape(tf.range(tf.shape(w)[0], dtype=tf.int32), [-1, 1])
+            < input_data[constants.N_ATOMS_BATCH_REAL]
+        )
+        real_f = tf.cast(real, q.dtype)
+        w_sum = tf.math.unsorted_segment_sum(w * real_f, map_at2struc, num_segments=n_struct)
+        n_real = tf.math.unsorted_segment_sum(real_f, map_at2struc, num_segments=n_struct)
+        w_mean = tf.math.divide_no_nan(w_sum, n_real)
+        return (tf.cast(self.phi_ref, q.dtype) + tf.cast(self.charge_slope, q.dtype) * q
+                + tf.cast(self.scale, q.dtype) * w_mean)

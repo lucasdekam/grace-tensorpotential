@@ -23,6 +23,7 @@ import tensorflow as tf
 from tensorpotential import constants
 from tensorpotential.extra.charge import constants as cc
 from tensorpotential.extra.charge.instructions import (
+    DirectWorkFunction,
     FiLMChargeScalar,
     HelmholtzChargeTarget,
 )
@@ -334,9 +335,22 @@ def GRACE_2LAYER_FILM(
     charge_normalize: str = "none",
     slab_normal_axis: int = 2,
     modulate_linear_channel: bool = True,
+    direct_work_function: bool = False,
+    wf_hidden_layers: list = None,
+    wf_activation: str = "tanh",
+    wf_phi_ref: float = 5.0,
+    wf_charge_slope: float = 9.16,
+    wf_train_phi_ref: bool = True,
+    wf_train_charge_slope: bool = True,
     **kwargs,
 ) -> InstructionManager:
     """`GRACE_2LAYER_v2_25` with FiLM charge conditioning on both readout branches.
+
+    `direct_work_function=True` (the `GRACE_2LAYER_FILM_WF` preset) adds a
+    second readout over the same two FiLM-conditioned branches, mean-pooled
+    over real atoms into a per-structure work function (`DirectWorkFunction`),
+    so Phi is its own observable rather than dE/dq. The `wf_*` arguments
+    configure that head; they are ignored otherwise.
 
     The readout sums `I_out_0_LN` (layer 1) and `I_1_LN` (layer 2), so BOTH are
     conditioned -- FiLMing only one would leave the other's energy contribution
@@ -641,10 +655,79 @@ def GRACE_2LAYER_FILM(
             zbl = ZBLPotential(bonds=d_ij, cutoff=zbl_cutoff, element_map=element_map)
             LinearOut2Target(origin=[zbl], target=out_instr, name="zbl_output")
 
+        if direct_work_function:
+            # its own readout over the energy's charge-conditioned invariants,
+            # then a mean over real atoms (DirectWorkFunction)
+            wf_atomic = CreateOutputTarget(name=cc.ATOMIC_WORK_FUNCTION)
+            LinMLPOut2ScalarTarget(
+                origin=[I_0_film, I_1_film],
+                target=wf_atomic,
+                hidden_layers=[64] if wf_hidden_layers is None else wf_hidden_layers,
+                activation=wf_activation,
+                name="wf_readout",
+            )
+            DirectWorkFunction(
+                atomic=wf_atomic,
+                phi_ref=wf_phi_ref,
+                charge_slope=wf_charge_slope,
+                train_phi_ref=wf_train_phi_ref,
+                train_charge_slope=wf_train_charge_slope,
+            )
+
     # `I_out_0_LN` is still the layer-1 tensor communicated across the multi-GPU
     # graph split; the FiLM that consumes it lives in the second half.
     instructor.communicated_keys = ["I_out_0_LN", "I"]
     return instructor
+
+
+@register_preset(
+    "GRACE_2LAYER_FILM_WF",
+    public=True,
+    settings={
+        "small": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 1,
+            "n_rad_max": [32, 32],
+            "prod_func_n_max": [32, 32],
+            "n_mlp_dens": 12,
+            "n_rad_base": 8,
+        },
+        "medium": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 1,
+            "n_rad_max": [42, 32],
+            "prod_func_n_max": [42, 64],
+            "n_mlp_dens": 16,
+            "n_rad_base": 10,
+        },
+        "large": {
+            "rcut": 6,
+            "lmax": [4, 3],
+            "max_order": 4,
+            "indicator_lmax": 3,
+            "n_rad_max": [42, 32],
+            "prod_func_n_max": [42, 64],
+            "n_mlp_dens": 16,
+            "n_rad_base": 10,
+        },
+    },
+)
+def GRACE_2LAYER_FILM_WF(element_map: dict, **kwargs) -> InstructionManager:
+    """`GRACE_2LAYER_FILM` plus a direct work-function head.
+
+    The energy is the FiLM model's, unchanged; the work function is a separate
+    readout of the same charge-conditioned invariant features, mean-pooled over
+    real atoms (`DirectWorkFunction`), after Wang, Fang, Huang & Liu,
+    J. Chem. Theory Comput. 21, 7628 (2025). Fit it to the SJM work function
+    directly; the energy's charge dependence then comes from energies and
+    forces alone. For constant-charge MD only; see `DirectWorkFunction`.
+    """
+    kwargs["direct_work_function"] = True
+    return GRACE_2LAYER_FILM(element_map=element_map, **kwargs)
 
 
 @register_preset(
@@ -1215,6 +1298,26 @@ def _tape_energy_forces_charge(instructions, input_data, training, local=False):
     return e_atomic, pair_f, g_q
 
 
+def _work_function_outputs(input_data, dedq, total_energy):
+    """`work_function` for the result dict, and `de_dq` when they differ.
+
+    A model with a `DirectWorkFunction` head has put its per-structure output
+    in `input_data` under PREDICT_WORK_FUNCTION_DIRECT during
+    `execute_instructions`; that is then THE work function, and the autograd
+    dE/dq is reported next to it as PREDICT_DE_DQ. Without the head,
+    work_function is dE/dq as before, and no extra key is emitted -- so every
+    existing model exports exactly the outputs it always did.
+    """
+    dedq = tf.zeros_like(total_energy) if dedq is None else dedq
+    direct = input_data.get(cc.PREDICT_WORK_FUNCTION_DIRECT)
+    if direct is None:
+        return {cc.PREDICT_WORK_FUNCTION: dedq}
+    return {
+        cc.PREDICT_WORK_FUNCTION: tf.cast(tf.reshape(direct, [-1, 1]), total_energy.dtype),
+        cc.PREDICT_DE_DQ: dedq,
+    }
+
+
 def _batch_energy_forces(input_data, e_atomic, pair_f):
     total_energy = tf.math.unsorted_segment_sum(
         e_atomic,
@@ -1269,9 +1372,7 @@ class ComputeBatchEnergyForcesCharge(TrainFunction):
             constants.PREDICT_TOTAL_ENERGY: total_energy,
             constants.PREDICT_FORCES: total_f,
             constants.PREDICT_ATOMIC_ENERGY: e_atomic,
-            cc.PREDICT_WORK_FUNCTION: (
-                tf.zeros_like(total_energy) if dedq is None else dedq
-            ),
+            **_work_function_outputs(input_data, dedq, total_energy),
         }
         if self.predict_bec:
             nat = tf.reshape(input_data[constants.N_ATOMS_BATCH_TOTAL], [])
@@ -1332,9 +1433,7 @@ class ComputeBatchEnergyForcesVirialsCharge(TrainFunction):
             constants.PREDICT_VIRIAL: compute_batch_virials_from_pair_forces(
                 pair_f, input_data
             ),
-            cc.PREDICT_WORK_FUNCTION: (
-                tf.zeros_like(total_energy) if dedq is None else dedq
-            ),
+            **_work_function_outputs(input_data, dedq, total_energy),
         }
         if self.predict_bec:
             nat = tf.reshape(input_data[constants.N_ATOMS_BATCH_TOTAL], [])
@@ -1404,9 +1503,7 @@ class ComputeStructureEnergyForcesVirialCharge(ComputeFunction):
                 pair_f, input_data
             ),
             constants.PREDICT_ATOMIC_ENERGY: e_atomic,
-            cc.PREDICT_WORK_FUNCTION: (
-                tf.zeros_like(total_energy) if dedq is None else dedq
-            ),
+            **_work_function_outputs(input_data, dedq, total_energy),
             "z_" + constants.PREDICT_PAIR_FORCES: pair_f,
         }
         if self.predict_bec:
